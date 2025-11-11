@@ -1594,6 +1594,11 @@ void TPDisk::WhiteboardReport(TWhiteboardReport &whiteboardReport) {
         if (*Mon.PDiskBriefState != TPDiskMon::TPDisk::Error) {
             pdiskState.SetAvailableSize(availableSize);
             pdiskState.SetTotalSize(totalSize);
+            P_LOG(PRI_INFO, PDEV01, "blobstorage_pdisk_impl.cpp:1597",
+                (ChunkSize, Format.ChunkSize),
+                (OwnerSystemLog, Keeper.GetOwnerHardLimit(OwnerSystemLog)),
+                (OwnerSystemReserve, Keeper.GetOwnerHardLimit(OwnerSystemReserve))
+            );
             pdiskState.SetSystemSize(Format.ChunkSize * (Keeper.GetOwnerHardLimit(OwnerSystemLog) + Keeper.GetOwnerHardLimit(OwnerSystemReserve)));
             pdiskState.SetLogUsedSize(Format.ChunkSize * (Keeper.GetOwnerHardLimit(OwnerCommonStaticLog) - Keeper.GetOwnerFree(OwnerCommonStaticLog, {})));
             pdiskState.SetLogTotalSize(Format.ChunkSize * Keeper.GetOwnerHardLimit(OwnerCommonStaticLog));
