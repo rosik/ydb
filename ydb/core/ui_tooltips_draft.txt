@@ -1,0 +1,123 @@
+PDisk Usage: Fraction of the PDisk’s shared data space used by all VDisks (log and system reserve excluded).
+> fact-check it's really excluded — YES (SharedQuota; log/system reserves outside it)
+PDisk Usage: How full the physical disk is (VDisk data only; system/log space excluded).
+PDisk Usage: Share of disk space used by VDisks. System and log reserves are not included.
+PDisk Usage: Share of PDdisk space allocated by VDisks. System and log reserves are not included.
+
+VDisk Slot Usage: How full this VDisk is relative to the LightYellow threshold (the point where tablets should stop writing more to it).
+> fix: LightYellow = tablets start *moving* to freer groups; *stop writing* is Yellow, later
+VDisk Slot Usage: Fraction of VDisk space occupied relative to the CapacityAlert warning threshold.
+VDisk Slot Usage: How close this VDisk is to the “move tablets elsewhere” warning. Can go above 100%.
+VDisk Slot Usage: Fill level vs the first low-space warning (tablets start relocating). May exceed 100% indicating a low-space .
+> Мне не нравится термин "Fill level"
+
+VDisk Raw Usage: How full this VDisk is relative to its fair share of the PDisk.
+VDisk Raw Usage: Fraction of VDisk space occupied relative to its fair capacity share of the PDisk.
+VDisk Raw Usage: How full this VDisk is vs its fair share of the disk. Over 100% = overused share.
+VDisk Raw Usage: Fill level vs this VDisk’s fair share of the PDisk. Can exceed 100%.
+
+Normalized Occupancy: Internal score of how loaded a VDisk/group is; used by Hive when choosing where to place tablets. Not a percentage.
+Normalized Occupancy: Internal 0…1 load score used when relocating tablets. Not a percentage.
+Normalized Occupancy: Backend load score from 0 to 1 (not %). Used to pick freer groups for tablets.
+Normalized Occupancy: Internal score (0..1) used for gently handling low-space cases.
+
+Capacity Alert: Free-space severity color from the storage backend (Green…Black), not a UI-computed percentage.
+Capacity Alert: Internal enum for gently handling low-space cases.
+Capacity Alert: Free-space severity as a color (Green…Black). Not a percentage.
+Capacity Alert: How severe the free-space situation is (color from Green to Black).
+Capacity Alert: Internal status (arbitrary text) for gently handling low-space cases.
+
+--- compromise (recommended) ---
+PDisk Usage: Share of PDisk space used by VDisks. System and log reserves are not included.
+PDisk Usage: Percentage of PDisk space used by VDisks. System and log reserves are not included.
+VDisk Slot Usage: Percentage of VDisk space used relative to the first low-space warning. Can exceed 100%.
+VDisk Raw Usage: Percentage of VDisk space used relative to its fair share on the PDisk. Can exceed 100%.
+Normalized Occupancy: Internal score used for gently handling low-space cases. Not a percentage.
+Capacity Alert: Internal named status used for gently handling low-space cases.
+
+--- final pick ---
+PDisk Usage: Share of PDisk space used by VDisks. System and log reserves are not included.
+VDisk Slot Usage: Percentage of VDisk space used relative to the first low-space warning. Can exceed 100%.
+VDisk Raw Usage: Percentage of VDisk space used relative to its fair share on the PDisk. Can exceed 100%.
+Normalized Occupancy: Internal score used for gently handling low-space cases.
+Capacity Alert: Internal named status used for gently handling low-space cases.
+
+> leftover choices vs your compromise:
+> - PDisk: Percentage (parallel to Slot/Raw) vs Share (softer)
+> - Occupancy: keep bare “score”, or add (0…1)?
+> - Capacity Alert: add (Green…Black) + “Not a percentage” for symmetry, or leave as is?
+
+--- Group Size In Units / Slot Size In Units ---
+
+Group Size In Units: Relative size of this storage group in abstract units (1 = single, 2 = double, …). VDisk space quota scales with this value.
+Group Size In Units: Group capacity multiplier (1 = single, 2 = double). Determines how much PDisk space each VDisk in the group may use.
+Group Size In Units: Relative capacity of this group vs a single-unit group. Larger value → larger VDisk quota on the PDisk.
+
+Slot Size In Units: Relative size of one VDisk slot on this PDisk in abstract units (1 = single, 2 = double, …).
+Slot Size In Units: Slot capacity multiplier on this PDisk (1 = single, 2 = double). Larger disks may use larger slots.
+Slot Size In Units: Relative size of a single slot on this PDisk. Same units as Group Size In Units.
+Slot Size In Units: Relative size of this PDisk in the cluster (1 = single, 2 = double, …). Same units as Group Size In Units.
+Slot Size In Units: Relative PDisk capacity in abstract units (1 = single, 2 = double, …). Larger disks get a larger value.
+> nuance: strictly it is slot size; larger PDisks usually get SlotSizeInUnits=2 (etc.) so the disk reads as “double”. Full relative capacity is closer to ExpectedSlotCount × SlotSizeInUnits.
+
+--- compromise ---
+Group Size In Units: Relative capacity of this group (1 = single, 2 = double, …). Sets VDisk space quota on the PDisk.
+Slot Size In Units: Relative size of this PDisk in the cluster (1 = single, 2 = double, …). Same units as Group Size In Units.
+
+--- formulations found in code (comments / descriptions) ---
+
+blobstorage_pdisk_config.h:
+  // Next 2 are either user-defined or inferred from drive size
+  ui32 ExpectedSlotCount = 0;
+  ui32 SlotSizeInUnits = 0;
+  // GetOwnerWeight: ceil(groupSizeInUnits / slotSizeInUnits), treating 0 as 1
+  //   return int(vu / pu) + !!(vu % pu);
+
+blobstorage_pdisk_config.proto:
+  ExpectedSlotCount = … // Number of slots to calculate per-vdisk disk space limit.
+  SlotSizeInUnits = …   // (no comment)
+
+blobstorage_pdisk.h (TEvCheckSpaceResult):
+  NumSlots;        // number of VDisks over PDisk, not their weight
+  NumActiveSlots;  // sum of VDisks weights - ∑ ceil(VSlot[i].GroupSizeInUnits / PDisk.SlotSizeInUnits)
+  ExpectedSlotCount = 0; // maximum number of VDisks over PDisk
+
+blobstorage_config.proto:
+  // this value is only accounted when new groups are added to the pool
+  DefaultGroupSizeInUnits = 102;
+  // NodeWarden infers PDiskConfig ExpectedSlotCount and SlotSizeInUnits by the formula
+  // ExpectedSlotCount = TotalSize / (UnitSize * SlotSizeInUnits)
+  // where SlotSizeInUnits = 2^N is chosen to meet ExpectedSlotCount <= MaxSlots
+  PreferInferredSettingsOverExplicit: // Unless true, PDisk.ExpectedSlotCount overrides inferred settings
+  TChangeGroupSizeInUnits: // if GroupId absent, then all groups in the pool are resized
+  GroupSizeInUnits on group info: (no comment)
+
+sys_view.proto:
+  ExpectedSlotCount = … // either inferred or user-defined
+  SlotSizeInUnits = …   // either inferred or user-defined
+  GroupSizeInUnits = …  // (no comment)
+  DefaultGroupSizeInUnits = … // (no comment)
+
+config.proto (ICB GroupMapperControls):
+  GroupSizeInUnitsLargerThanPDiskPenalty:
+    Description: "Group size in units larger than pdisk penalty"
+  GroupSizeInUnitsSmallerThanPDiskPenalty:
+    Description: "Group size in units smaller than penalty in pdisk"
+
+group_mapper.cpp (GetPickerScore comments):
+  // double-unit vdisk occupies two single pdisk slots
+  // single-unit vdisk occupies double-unit pdisk slot (storage waste)
+
+CHANGELOG.md:
+  Introduced two new Distributed Storage parameters —
+  GroupSizeInUnits property of storage groups and SlotSizeInUnits of PDisks.
+
+docs (ExpectedSlotCount only; no Group/Slot Size In Units tooltips yet):
+  system-views: "Maximum number of VSlots that can be created on this PDisk"
+  capacity-planning: "the number of slots per PDisk"
+
+RFC 0127 / 156 (not code, but source wording):
+  slot_size_in_units — размер слота в условных единицах (двойные, четверные и т.д.)
+  group_size_in_units — у сторадж групп; VDisk получают квоту пропорционально размеру;
+    двойной VDisk займет два слота на PDisk с одинарными слотами (и получит двойную квоту);
+    одинарный VDisk на PDisk с двойными слотами получит один слот.

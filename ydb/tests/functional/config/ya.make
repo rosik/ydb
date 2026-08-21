@@ -8,6 +8,7 @@ TEST_SRCS(
     test_distconf_self_heal.py
     test_distconf_sentinel_node_status.py
     test_generate_dynamic_config.py
+    test_infer_pdisk_host_config_replace.py
     test_module_parameter.py
     test_pdisk_metadata_cli.py
     test_distconf_faulty_pdisk_remove_host.py

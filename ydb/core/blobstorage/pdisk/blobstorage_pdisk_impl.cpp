@@ -1800,6 +1800,7 @@ void TPDisk::WhiteboardReport(TWhiteboardReport &whiteboardReport) {
         if (ExpectedSlotSize) {
             pDiskMetrics.SetExpectedSlotSize(ExpectedSlotSize);
         }
+        pDiskMetrics.SetNumActiveSlots(numActiveSlots);
 
         double pdiskUsage = Keeper.GetPDiskUsage();
         pDiskMetrics.SetPDiskUsage(pdiskUsage);
@@ -2314,6 +2315,7 @@ void TPDisk::ProcessChangeExpectedSlotCount(TChangeExpectedSlotCount& request) {
     ExpectedSlotCount = request.ExpectedSlotCount;
     ExpectedSlotSize = request.ExpectedSlotSize;
     NormalizeExpectedSlotSettings();
+    // No changes are needed here.
     Cfg->SlotSizeInUnits = request.SlotSizeInUnits;
     Keeper.SetExpectedOwnerSettings(ExpectedSlotCount, GetExpectedOwnerSizeInChunks());
     for (TOwner owner = OwnerBeginUser; owner < OwnerEndUser; ++owner) {

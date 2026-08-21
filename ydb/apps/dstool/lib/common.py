@@ -299,8 +299,21 @@ def get_pdisk_inferred_settings(pdisk):
         return pdisk.ExpectedSlotCount, pdisk.PDiskConfig.SlotSizeInUnits
 
 
-def get_vslot_owner_weight(group_size_in_units, pdisk_slot_size_in_units):
-    # Identical to blobstorage/pdisk/blobstorage_pdisk_config.h GetOwnerWeight()
+def get_pdisk_expected_slot_size(pdisk):
+    """Return the effective per-slot size in bytes, or 0 if not configured."""
+    if pdisk.PDiskMetrics.HasField('ExpectedSlotSize') and pdisk.PDiskMetrics.ExpectedSlotSize:
+        return pdisk.PDiskMetrics.ExpectedSlotSize
+    if pdisk.PDiskConfig.HasField('ExpectedSlotSize') and pdisk.PDiskConfig.ExpectedSlotSize:
+        return pdisk.PDiskConfig.ExpectedSlotSize
+    return 0
+
+
+def get_vslot_owner_weight(group_size_in_units, pdisk_slot_size_in_units, pdisk_expected_slot_size=0):
+    # Mirrors blobstorage/pdisk/blobstorage_pdisk_config.h TPDiskConfig::GetOwnerWeight().
+    # RFC 178: in new mode (pdisk_expected_slot_size set), weight = max(GroupSizeInUnits, 1).
+    # SlotSizeInUnits is always 1 in new mode and is not used in the calculation.
+    if pdisk_expected_slot_size:
+        return group_size_in_units if group_size_in_units else 1
     vu = group_size_in_units if group_size_in_units else 1
     pu = pdisk_slot_size_in_units if pdisk_slot_size_in_units else 1
     return int(vu / pu) + (1 if (vu % pu) else 0)

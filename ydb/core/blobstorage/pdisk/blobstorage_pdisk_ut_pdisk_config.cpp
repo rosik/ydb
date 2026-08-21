@@ -17,6 +17,7 @@ Y_UNIT_TEST_SUITE(TPDiskConfig) {
         using namespace NPDisk;
         using namespace NKikimrBlobStorage;
 
+        // Legacy mode (no ExpectedSlotSize): weight = ceil(GroupSizeInUnits / SlotSizeInUnits)
         UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(0, 0), 1);
         UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(1, 0), 1);
         UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(2, 0), 2);
@@ -45,17 +46,33 @@ Y_UNIT_TEST_SUITE(TPDiskConfig) {
         UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(99, 100), 1);
         UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(101, 100), 2);
 
-        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(4, 1, 100ull << 30), 1);
-        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(101, 100, 100ull << 30), 1);
+        // New mode (ExpectedSlotSize set): weight = max(GroupSizeInUnits, 1).
+        // SlotSizeInUnits is ignored — it is always 1 in new mode.
+        // RFC 178: OwnerWeight = max(GroupSizeInUnits, 1)
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(0, 0, 100ull << 30), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(1, 0, 100ull << 30), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(2, 0, 100ull << 30), 2);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(4, 0, 100ull << 30), 4);
+        // SlotSizeInUnits is ignored when expectedSlotSize is set
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(4, 1, 100ull << 30), 4);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(1, 4, 100ull << 30), 1);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(2, 4, 100ull << 30), 2);
+        UNIT_ASSERT_VALUES_EQUAL(TPDiskConfig::GetOwnerWeight(101, 100, 100ull << 30), 101);
 
+        // Instance method: legacy mode (no ExpectedSlotSize), SlotSizeInUnits=3
         TPDiskConfig pdiskConfig3u(0, 0, 0);
         pdiskConfig3u.SlotSizeInUnits = 3;
         UNIT_ASSERT_VALUES_EQUAL(pdiskConfig3u.GetOwnerWeight(10), 4);
 
+        // Instance method: new mode (ExpectedSlotSize set).
+        // SlotSizeInUnits is ignored; weight = max(GroupSizeInUnits, 1).
         TPDiskConfig pdiskConfigFixedSize(0, 0, 0);
         pdiskConfigFixedSize.SlotSizeInUnits = 3;
         pdiskConfigFixedSize.ExpectedSlotSize = 100ull << 30;
-        UNIT_ASSERT_VALUES_EQUAL(pdiskConfigFixedSize.GetOwnerWeight(10), 1);
+        UNIT_ASSERT_VALUES_EQUAL(pdiskConfigFixedSize.GetOwnerWeight(0), 1);
+        UNIT_ASSERT_VALUES_EQUAL(pdiskConfigFixedSize.GetOwnerWeight(1), 1);
+        UNIT_ASSERT_VALUES_EQUAL(pdiskConfigFixedSize.GetOwnerWeight(2), 2);
+        UNIT_ASSERT_VALUES_EQUAL(pdiskConfigFixedSize.GetOwnerWeight(10), 10);
 
         // TODO(ydynnikov): test the case of groupSizeInUnits > UI8_MAX (255)
     }

@@ -97,7 +97,7 @@ message TPDiskConfig {
     optional uint32 CompletionThreadsCount = 2003;
     optional bool UseNoopScheduler = 2004;
     optional bool PlainDataChunks = 2005;
-    optional uint32 SlotSizeInUnits = 2006;
+    optional uint32 SlotSizeInUnits = 2006; // Deprecated in 26.5
     optional bool SeparateHugePriorities = 2007;
     optional bool UseBytesFlightControl = 2008;
     optional uint32 IoPieceSizeBytes = 2009;
