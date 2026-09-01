@@ -17,7 +17,7 @@ namespace NPDisk {
 struct TOwnerInfo {
     i64 ChunksOwned;
     TVDiskID VDiskId;
-    ui32 Weight;
+    ui32 GroupSizeInUnits;
 };
 
 struct TKeeperParams {
@@ -27,8 +27,12 @@ struct TKeeperParams {
     // Split main chunk pool between this many owners (or 0 for 'split as you go' mode)
     i64 ExpectedOwnerCount = 0;
 
-    // Exact chunk quota for one owner weight unit; 0 means derive it from ExpectedOwnerCount
+    // Exact chunk quota for one slot of SlotSizeInUnits; 0 means derive it from ExpectedOwnerCount
     i64 ExpectedOwnerSize = 0;
+
+    // Size of a single slot in units; owner quotas are distributed proportionally to their
+    // GroupSizeInUnits matched against this value. 0 is treated as 1.
+    ui32 SlotSizeInUnits = 0;
 
     // Number of chunks used for format record and system log
     i64 SysLogSize = 0;

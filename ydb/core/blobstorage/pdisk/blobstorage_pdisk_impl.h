@@ -394,7 +394,6 @@ public:
     void ProcessChangeExpectedSlotCount(TChangeExpectedSlotCount& request);
     void NormalizeExpectedSlotSettings();
     i64 GetExpectedOwnerSizeInChunks() const;
-    ui32 GetOwnerWeight(ui32 groupSizeInUnits) const;
 
     // Scheduler weight configuration
     void ConfigureCbs(ui32 ownerId, EGate gate, ui64 weight);

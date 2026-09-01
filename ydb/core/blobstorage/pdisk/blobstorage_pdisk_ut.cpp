@@ -1954,7 +1954,6 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         // State 1:
         // PDisk.ExpectedSlotCount: 0
         // Owners.GroupSizeInUnits: [0u, 2u]
-        // Owners.Weight: [1, 2]
         Cerr << (TStringBuilder() << "- State 1" << Endl);
 
         TVDiskMock vdisk0(&testCtx);
@@ -2008,7 +2007,6 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         // PDisk.ExpectedSlotCount: 2
         // PDisk.SlotSizeInUnits: 2u
         // Owners.GroupSizeInUnits: [0u, 2u]
-        // Owners.Weight: [1, 1]
         Cerr << (TStringBuilder() << "- State 4" << Endl);
 
         testCtx.TestResponse<NPDisk::TEvChangeExpectedSlotCountResult>(
@@ -2019,34 +2017,34 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         UNIT_ASSERT_VALUES_EQUAL(pdiskConfig->SlotSizeInUnits, 2u);
         AwaitAndCheckEvPDiskStateUpdate(testCtx, 2u, 2);
 
-        fairQuota = sharedQuota / 2;
-        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 389);
+        // The single-unit vdisk0 keeps only half of the double-unit slot quota
+        fairQuota = sharedQuota / 4; // per unit
+        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 194);
         UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, 194);
-        UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, fairQuota/2);
-        vdisk0LightYellowLimit = 344;
+        UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, fairQuota);
+        vdisk0LightYellowLimit = 168;
         vdisk0SlotUtilization = 100. * ((double)vdisk0Used) / vdisk0LightYellowLimit;
-        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 56.4, 0.1);
-        CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, 0.5, vdisk0SlotUtilization, 25.0, 2, 2, TColor::GREEN);
-        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota, 0, 0.25, 0.0, 25.0, 2, 2, TColor::GREEN);
+        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 115.5, 0.1);
+        CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, 0.97, vdisk0SlotUtilization, 25.0, 2, 2, TColor::ORANGE);
+        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota*2, 0, 0.25, 0.0, 25.0, 2, 2, TColor::GREEN);
 
         // State 5:
         // Owners.GroupSizeInUnits: [0u, 2u, 4u]
-        // Owners.Weight: [1, 1, 2]
         Cerr << (TStringBuilder() << "- State 5" << Endl);
 
         TVDiskMock vdisk2(&testCtx);
         vdisk2.InitFull(4u);
         vdisk2.SendEvLogSync();
 
-        fairQuota = sharedQuota / 4;
-        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 194);
-        UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, fairQuota);
-        vdisk0LightYellowLimit = 168;
+        fairQuota = sharedQuota / 7; // per unit
+        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 111);
+        UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, 194);
+        vdisk0LightYellowLimit = 93;
         vdisk0SlotUtilization = 100. * ((double)vdisk0Used) / vdisk0LightYellowLimit;
-        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 115.5, 0.1);
+        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 208.6, 0.1);
         CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, 0.97, vdisk0SlotUtilization, 25.0, 3, 4, TColor::ORANGE);
-        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota, 0, 0.25, 0.0, 25.0, 3, 4, TColor::GREEN);
-        CheckEvCheckSpace(testCtx, vdisk2, sharedFree, fairQuota*2, 0, 0.25, 0.0, 25.0, 3, 4, TColor::GREEN);
+        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota*2, 0, 0.25, 0.0, 25.0, 3, 4, TColor::GREEN);
+        CheckEvCheckSpace(testCtx, vdisk2, sharedFree, fairQuota*4, 0, 0.25, 0.0, 25.0, 3, 4, TColor::GREEN);
 
         auto &icb = testCtx.GetRuntime()->GetAppData().Icb;
         TControlWrapper semiStrictSpaceIsolation(0, 0, 2);
@@ -2059,7 +2057,6 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
 
         // State 6:
         // Owners.GroupSizeInUnits: [0u, 2u, 1u]
-        // Owners.Weight: [1, 1, 1]
         Cerr << (TStringBuilder() << "- State 6" << Endl);
 
         testCtx.TestResponse<NPDisk::TEvYardResizeResult>(
@@ -2067,22 +2064,21 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
             NKikimrProto::OK);
         AwaitAndCheckEvPDiskStateUpdate(testCtx, 2u, 3);
 
-        fairQuota = sharedQuota / 3;
-        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 259);
-        vdisk0LightYellowLimit = 227;
+        fairQuota = sharedQuota / 4; // per unit
+        UNIT_ASSERT_VALUES_EQUAL(fairQuota, 194);
+        UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, fairQuota);
+        vdisk0LightYellowLimit = 168;
         vdisk0SlotUtilization = 100. * ((double)vdisk0Used) / vdisk0LightYellowLimit;
-        double vdisk0FairOccupancy = ((double)vdisk0Used) / fairQuota;
-        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0FairOccupancy, 0.749, 0.001);
-        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 85.4, 0.1);
-        CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, vdisk0FairOccupancy, vdisk0SlotUtilization, 25.0, 3, 3, TColor::GREEN);
-        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota, 0, 0.25, 0.0, 25.0, 3, 3, TColor::GREEN);
+        double vdisk0FairOccupancy = 0.97;
+        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 115.5, 0.1);
+        CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, vdisk0FairOccupancy, vdisk0SlotUtilization, 25.0, 3, 3, TColor::ORANGE);
+        CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota*2, 0, 0.25, 0.0, 25.0, 3, 3, TColor::GREEN);
         CheckEvCheckSpace(testCtx, vdisk2, sharedFree, fairQuota, 0, 0.25, 0.0, 25.0, 3, 3, TColor::GREEN);
 
         // State 7:
         // PDisk.ExpectedSlotCount: 8
         // PDisk.SlotSizeInUnits: 1u
         // Owners.GroupSizeInUnits: [0u, 2u, 1u]
-        // Owners.Weight: [1, 2, 1]
         Cerr << (TStringBuilder() << "- State 7" << Endl);
 
         testCtx.TestResponse<NPDisk::TEvChangeExpectedSlotCountResult>(
@@ -2099,7 +2095,7 @@ Y_UNIT_TEST_SUITE(TPDiskTest) {
         UNIT_ASSERT_VALUES_EQUAL(vdisk0Used, fairQuota*2);
         vdisk0LightYellowLimit = 81;
         vdisk0SlotUtilization = 100. * ((double)vdisk0Used) / vdisk0LightYellowLimit;
-        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0FairOccupancy, 0.749, 0.001);
+        UNIT_ASSERT_DOUBLES_EQUAL(vdisk0FairOccupancy, 0.97, 0.01);
         UNIT_ASSERT_DOUBLES_EQUAL(vdisk0SlotUtilization, 239.5, 0.1);
         CheckEvCheckSpace(testCtx, vdisk0, sharedFree, fairQuota, vdisk0Used, 0.965, vdisk0SlotUtilization, 25.0, 3, 4, TColor::ORANGE);
         CheckEvCheckSpace(testCtx, vdisk1, sharedFree, fairQuota*2, 0, 0.25, 0.0, 25.0, 3, 4, TColor::GREEN);

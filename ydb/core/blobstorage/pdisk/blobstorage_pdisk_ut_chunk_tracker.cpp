@@ -126,7 +126,7 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetSpaceColor(owner2, &occupancy), TColor::LIGHT_YELLOW);
     }
 
-    Y_UNIT_TEST(AddOwnerWithWeight) {
+    Y_UNIT_TEST(AddOwnerWithGroupSizeInUnits) {
         using namespace NPDisk;
 
         TChunkTracker chunkTracker;
@@ -180,7 +180,7 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerUsed(101), 5);
     }
 
-    Y_UNIT_TEST(ExpectedOwnerSizeForcesOwnerWeightToOne) {
+    Y_UNIT_TEST(ExpectedOwnerSizeProportionalToGroupSizeInUnits) {
         using namespace NPDisk;
 
         TChunkTracker chunkTracker;
@@ -200,14 +200,15 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         chunkTracker.AddOwner(101, DynamicVDiskId(), 1);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 30);
 
+        // The expected owner size is expressed per slot; an owner gets a share proportional to its size in units
         chunkTracker.AddOwner(102, DynamicVDiskId(), 2);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 30);
-        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 30);
-        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerWeight(102), 1);
-        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 60);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerGroupSizeInUnits(102), 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 3);
 
         chunkTracker.SetExpectedOwnerSize(0);
-        chunkTracker.SetOwnerWeight(102, 2);
+        chunkTracker.SetOwnerGroupSizeInUnits(102, 2);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 25);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 50);
     }
@@ -396,11 +397,11 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         chunkTracker.AddOwner(staticOwner, StaticVDiskId());
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerStaticReserve(staticOwner), 25);
 
-        chunkTracker.SetOwnerWeight(staticOwner, 2);
+        chunkTracker.SetOwnerGroupSizeInUnits(staticOwner, 2);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerStaticReserve(staticOwner), 50);
 
         chunkTracker.SetExpectedOwnerSettings(2, 0);
-        chunkTracker.SetOwnerWeight(staticOwner, 1);
+        chunkTracker.SetOwnerGroupSizeInUnits(staticOwner, 1);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerStaticReserve(staticOwner), 50);
 
         chunkTracker.SetExpectedOwnerSettings(4, 10);
@@ -426,7 +427,7 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         params.OwnersInfo[staticOwner] = {
             .ChunksOwned = 95,
             .VDiskId = StaticVDiskId(),
-            .Weight = 1,
+            .GroupSizeInUnits = 1,
         };
 
         // An overused disk must start up. The reserve is the personal quota as usual, and nothing is held back for
@@ -478,7 +479,7 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
 
         // The first owner needs a bigger reserve while the second one has a surplus. The new reserves must take
         // effect right away, not as the chunks of the shared quota happen to be released.
-        chunkTracker.SetOwnerWeight(firstStatic, 3);
+        chunkTracker.SetOwnerGroupSizeInUnits(firstStatic, 3);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(firstStatic), 60);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(secondStatic), 20);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerStaticReserve(firstStatic), 37);
@@ -632,12 +633,12 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         params.OwnersInfo[staticOwner] = {
             .ChunksOwned = 0,
             .VDiskId = StaticVDiskId(),
-            .Weight = 1,
+            .GroupSizeInUnits = 1,
         };
         params.OwnersInfo[dynamicOwner] = {
             .ChunksOwned = 390,
             .VDiskId = DynamicVDiskId(),
-            .Weight = 1,
+            .GroupSizeInUnits = 1,
         };
 
         // A disk filled to the brim must start up: the log pool takes what is free and nothing of what is used
@@ -680,7 +681,7 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetTotalHardLimit(), 100);
     }
 
-    Y_UNIT_TEST(ZeroWeight) {
+    Y_UNIT_TEST(ZeroGroupSizeInUnits) {
         using namespace NPDisk;
 
         TChunkTracker chunkTracker;
@@ -700,8 +701,8 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 1);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 50);
 
-        // Weigh can't be zero (0 is treated as 1)
-        chunkTracker.SetOwnerWeight(101, 0);
+        // GroupSizeInUnits can't be zero (0 is treated as 1)
+        chunkTracker.SetOwnerGroupSizeInUnits(101, 0);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 1);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 50);
 
@@ -709,6 +710,77 @@ Y_UNIT_TEST_SUITE(TChunkTrackerTest) {
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 2);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 25);
         UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 25);
+    }
+
+    Y_UNIT_TEST(GroupSizeInUnitsMatchedAgainstSlotSizeInUnits) {
+        using namespace NPDisk;
+
+        TChunkTracker chunkTracker;
+        TKeeperParams params {
+            .TotalChunks = 205 /*system*/ + 80,
+            .ExpectedOwnerCount = 2, // slots
+            .SlotSizeInUnits = 2,
+        };
+
+        TString errorReason;
+        UNIT_ASSERT_C(chunkTracker.Reset(params, TColorLimits::MakeLogLimits(), errorReason), errorReason);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetTotalHardLimit(), 80);
+
+        // A single-unit VDisk occupying a double-unit slot must get only half of the slot quota
+        chunkTracker.AddOwner(101, DynamicVDiskId(), 1);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 1);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 20); // 80 chunks / 4 units
+
+        chunkTracker.AddOwner(102, DynamicVDiskId(), 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 20);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 40);
+
+        chunkTracker.AddOwner(103, DynamicVDiskId(), 4);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 4);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 11); // 80 chunks / 7 units
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 22);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(103), 44);
+
+        chunkTracker.SetOwnerGroupSizeInUnits(103, 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 3);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 16); // 80 chunks / 5 units
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 32);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(103), 32);
+
+        chunkTracker.RemoveOwner(103);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 2);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 20);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 40);
+    }
+
+    Y_UNIT_TEST(ResetWithOwnersInfoAndSlotSizeInUnits) {
+        using namespace NPDisk;
+
+        TChunkTracker chunkTracker;
+        TKeeperParams params {
+            .TotalChunks = 205 /*system*/ + 80,
+            .ExpectedOwnerCount = 2, // slots
+            .SlotSizeInUnits = 2,
+        };
+        params.OwnersInfo[101] = {
+            .ChunksOwned = 0,
+            .VDiskId = DynamicVDiskId(1),
+            .GroupSizeInUnits = 1,
+        };
+        params.OwnersInfo[102] = {
+            .ChunksOwned = 10,
+            .VDiskId = DynamicVDiskId(2),
+            .GroupSizeInUnits = 2,
+        };
+
+        TString errorReason;
+        UNIT_ASSERT_C(chunkTracker.Reset(params, TColorLimits::MakeLogLimits(), errorReason), errorReason);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetTotalHardLimit(), 80);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(101), 20);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerHardLimit(102), 40);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetOwnerUsed(102), 10);
+        UNIT_ASSERT_EQUAL_X(chunkTracker.GetNumActiveSlots(), 2);
     }
 }
 

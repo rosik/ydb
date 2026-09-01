@@ -63,12 +63,12 @@ public:
     // Add/remove owner
     //
 
-    void AddOwner(TOwner owner, TVDiskID vdiskId, ui32 weight) {
-        ChunkTracker.AddOwner(owner, vdiskId, weight);
+    void AddOwner(TOwner owner, TVDiskID vdiskId, ui32 groupSizeInUnits) {
+        ChunkTracker.AddOwner(owner, vdiskId, groupSizeInUnits);
     }
 
-    void SetOwnerWeight(TOwner owner, ui32 weight) {
-        ChunkTracker.SetOwnerWeight(owner, weight);
+    void SetOwnerGroupSizeInUnits(TOwner owner, ui32 groupSizeInUnits) {
+        ChunkTracker.SetOwnerGroupSizeInUnits(owner, groupSizeInUnits);
     }
 
     void RemoveOwner(TOwner owner) {
@@ -98,8 +98,8 @@ public:
         return ChunkTracker.GetOwnerUsed(owner);
     }
 
-    ui32 GetOwnerWeight(TOwner owner) {
-        return ChunkTracker.GetOwnerWeight(owner);
+    ui32 GetOwnerGroupSizeInUnits(TOwner owner) const {
+        return ChunkTracker.GetOwnerGroupSizeInUnits(owner);
     }
 
     i64 GetLogChunkCount() const {
@@ -213,6 +213,10 @@ public:
 
     void SetExpectedOwnerCount(size_t newOwnerCount) {
         ChunkTracker.SetExpectedOwnerCount(newOwnerCount);
+    }
+
+    void SetSlotSizeInUnits(ui32 slotSizeInUnits) {
+        ChunkTracker.SetSlotSizeInUnits(slotSizeInUnits);
     }
 
     void SetExpectedOwnerSize(i64 newOwnerSize) {

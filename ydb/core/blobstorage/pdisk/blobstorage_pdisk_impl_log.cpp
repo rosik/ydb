@@ -1736,6 +1736,7 @@ void TPDisk::ProcessReadLogResult(const NPDisk::TEvReadLogResult &evReadLogResul
                 params.TotalChunks = Format.DiskSizeChunks();
                 params.ExpectedOwnerCount = Cfg->ExpectedSlotCount;
                 params.ExpectedOwnerSize = GetExpectedOwnerSizeInChunks();
+                params.SlotSizeInUnits = Cfg->SlotSizeInUnits;
                 params.SysLogSize = Format.SystemChunkCount; // sysLogSize = chunk 0 + additional SysLog chunks
                 params.CommonLogSize = LogChunks.size();
 
@@ -1756,7 +1757,7 @@ void TPDisk::ProcessReadLogResult(const NPDisk::TEvReadLogResult &evReadLogResul
                         params.OwnersInfo[ownerId] = {
                             .ChunksOwned = usedForOwner[ownerId],
                             .VDiskId = OwnerData[ownerId].VDiskId,
-                            .Weight = GetOwnerWeight(OwnerData[ownerId].GroupSizeInUnits),
+                            .GroupSizeInUnits = OwnerData[ownerId].GroupSizeInUnits,
                         };
                     }
                 }
