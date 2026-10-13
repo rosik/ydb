@@ -141,10 +141,14 @@ analyzer; a different executable can produce different candidates.
 
 `request_ok` means `blob_range` returned the requested blob with `Status=OK`;
 `absent` means it returned an empty list. Neither removes a finding. A later
-scan removes findings it no longer observes only if the VDisk coverage matches
-the previous report, or includes all nine VDisks. Changed coverage
-preserves unresolved findings conservatively. `disappeared` means no longer a
-candidate, not proof that a blob was copied rather than garbage-collected.
+scan removes each finding it no longer observes only if the VDisk coverage
+matches the scan that last observed that finding, or includes all nine VDisks.
+Coverage is persisted per finding: repeated scans of a different set of VDisks
+cannot close an older finding. Groups with unresolved findings use
+the retry interval even when the latest scan has no candidates. The report's
+`unresolved` count includes findings retained from earlier scans.
+`disappeared` means no longer a candidate, not proof that a blob was copied
+rather than garbage-collected.
 `new_total` includes initially discovered and subsequently reappearing candidates.
 Scan errors preserve existing findings. Repair failures remain visible and are
 retried after another scan; there is no permanent processed-blob blacklist.

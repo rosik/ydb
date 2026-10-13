@@ -2,6 +2,10 @@ PY3TEST()
 
 SIZE(SMALL)
 
+SRCDIR(ydb/apps/dstool)
+
+PY_SRCS(main.py=ydb.apps.dstool.main)
+
 TEST_SRCS(
     test_write2x2service.py
     test_capacity_metrics.py
