@@ -19,6 +19,12 @@ def get_version():
 
 
 def main(args=None):
+    args = list(sys.argv[1:] if args is None else args)
+    # Service workers do not require a remote cluster endpoint. The master
+    # and workers use the colocated viewer unless an endpoint is explicitly set.
+    service = any(args[i:i + 2] == ['cluster', 'write2x2service'] for i in range(len(args) - 1))
+    if service and not any(a in ('-e', '--endpoint') or a.startswith('--endpoint=') for a in args):
+        args = ['-e', 'localhost'] + args
     parser = ArgumentParser(description='YDB Distributed Storage Administration Tool', version=get_version())
 
     # common options

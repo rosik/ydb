@@ -63,6 +63,7 @@ except ImportError:
     _nbs_partition_modules = []
 
 import ydb.apps.dstool.lib.dstool_cmd_cluster_workload_nbs_dbg_like as cluster_workload_nbs_dbg_like
+import ydb.apps.dstool.lib.dstool_cmd_cluster_write2x2service as cluster_write2x2service
 
 import sys
 import ydb.apps.dstool.lib.common as common
@@ -70,6 +71,7 @@ import ydb.apps.dstool.lib.common as common
 MODULE_PREFIX = 'dstool_cmd_'
 
 modules = [
+    cluster_write2x2service,
     cluster_workload_nbs_dbg_like,
     cluster_balance, cluster_reanimate, cluster_get, cluster_set, cluster_list, cluster_workload_run,
     node_list,
@@ -91,7 +93,7 @@ default_structure = [
     ('pool', ['list', 'set', ('create', ['virtual'])]),
     ('box', ['list']),
     ('node', ['list']),
-    ('cluster', ['balance', 'reanimate', 'get', 'set', ('workload', ['run', 'nbs-dbg-like']), 'list']),
+    ('cluster', ['balance', 'reanimate', 'get', 'set', ('workload', ['run', 'nbs-dbg-like']), 'list', 'write2x2service']),
 ]
 
 # Only expose the `nbs partition ...` subcommand tree when the modules are
