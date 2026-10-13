@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-from ydb.apps.dstool.lib.arg_parser import ArgumentParser
+from ydb.apps.dstool.lib.arg_parser import ArgumentParser, print_error_with_usage
 import ydb.apps.dstool.lib.common as common
 import ydb.apps.dstool.lib.commands as commands
 
@@ -20,20 +20,20 @@ def get_version():
 
 def main(args=None):
     args = list(sys.argv[1:] if args is None else args)
-    # Service workers do not require a remote cluster endpoint. The master
-    # and workers use the colocated viewer unless an endpoint is explicitly set.
-    service = any(args[i:i + 2] == ['cluster', 'write2x2service'] for i in range(len(args) - 1))
-    if service and not any(a in ('-e', '--endpoint') or a.startswith('--endpoint=') for a in args):
-        args = ['-e', 'localhost'] + args
     parser = ArgumentParser(description='YDB Distributed Storage Administration Tool', version=get_version())
 
     # common options
-    common.add_host_access_options(parser)
+    common.add_host_access_options(parser, endpoint_required=False)
     parser.add_argument('--dry-run', '-n', action='store_true', help='Run command without side effects')
 
     subparsers = parser.add_subparsers(help='Subcommands', dest='global_command', required=True)
     command_map = commands.make_command_map_by_structure(subparsers)
     args = parser.parse_args(args)
+    if not args.endpoint:
+        if args.global_command == 'cluster' and args.cluster_command == 'write2x2service':
+            args.endpoint = ['localhost']
+        else:
+            print_error_with_usage(parser, 'Value endpoint is required')
     try:
         common.apply_args(args)
         commands.run_command(command_map, args)

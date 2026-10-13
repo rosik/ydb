@@ -54,9 +54,10 @@ def do(args):
     if args.write2x2_action == 'worker' and not 0 <= args.repair_delay <= 3600:
         raise ValueError('--repair-delay must be in [0, 3600]')
     if args.write2x2_action == 'worker':
-        binary = Path(args.blobsan).expanduser()
+        binary = Path(args.blobsan).expanduser().resolve()
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise ValueError('blobsan is not an executable file: ' + str(binary))
+        args.blobsan = str(binary)
     if args.write2x2_action == 'master' and args.listen > 65535:
         raise ValueError('Invalid listen port')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')

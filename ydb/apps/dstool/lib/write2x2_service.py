@@ -39,6 +39,10 @@ def encode(value):
     return json.dumps(value, separators=(',', ':')).encode()
 
 
+def has_two_complete_realms(indexes):
+    return sum(all(r * 3 + d in indexes for d in range(3)) for r in range(3)) >= 2
+
+
 def atomic_json(path, value):
     tmp = path.with_suffix('.tmp')
     with tmp.open('wb') as out:
@@ -104,7 +108,7 @@ def topology(args):
     slots = {(s.VSlotId.NodeId, s.VSlotId.PDiskId, s.VSlotId.VSlotId): s for s in base.VSlot}
     groups = {}
     for row in base.Group:
-        if row.ErasureSpecies != 9 or row.HasField('VirtualGroupInfo'):
+        if row.ErasureSpecies != 'mirror-3-dc' or row.HasField('VirtualGroupInfo'):
             continue
         group = dict(id=row.GroupId, generation=row.GroupGeneration,
                      pool=pools.get((row.BoxId, row.StoragePoolId)), slots=[])
@@ -167,7 +171,7 @@ class Master:
             CREATE TABLE IF NOT EXISTS workers(id TEXT PRIMARY KEY, seen REAL, info TEXT);
             CREATE TABLE IF NOT EXISTS findings(
                 gid INTEGER, blob TEXT, first_seen REAL, last_seen REAL, active INTEGER,
-                status TEXT, PRIMARY KEY(gid,blob));
+                status TEXT, coverage TEXT NOT NULL, PRIMARY KEY(gid,blob));
         ''')
         for key, value in [('paused', 0), ('interval', args.interval), ('retry', args.retry)]:
             self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', (key, str(value)))
@@ -247,31 +251,35 @@ class Master:
             error = result.get('error')
             if not error:
                 findings = result['findings']
-                if not isinstance(findings, dict) or any(not re.fullmatch(r'\[(?:\d+:){6}0\]', b)
-                                                        or not isinstance(s, str) for b, s in findings.items()):
+                if not isinstance(findings, dict) or any(
+                        not re.fullmatch(r'\[(?:\d+:){6}0\]', b) or not isinstance(s, str) for b, s in findings.items()):
                     raise ValueError('Invalid findings')
                 completed = result['completed_vdisks']
                 if not isinstance(completed, list) or any(i not in range(9) for i in completed) or len(set(completed)) != len(completed):
                     raise ValueError('Invalid coverage')
-                if sum(all(r * 3 + d in completed for d in range(3)) for r in range(3)) < 2:
+                if not has_two_complete_realms(completed):
                     raise ValueError('Incomplete scan')
-                previous = {r['blob'] for r in self.db.execute('SELECT blob FROM findings WHERE gid=? AND active=1', (gid,))}
-                prior = json.loads(row['last_result'] or '{}').get('completed_vdisks', [])
-                comparable = len(completed) == 9 or set(completed) == set(prior)
-                if comparable:
-                    self.db.execute('UPDATE findings SET active=0 WHERE gid=?', (gid,))
+                previous = {r['blob']: r['coverage'] for r in self.db.execute(
+                    'SELECT blob,coverage FROM findings WHERE gid=? AND active=1', (gid,))}
+                resolved = {blob for blob, coverage in previous.items() if blob not in findings and
+                            (len(completed) == 9 or set(completed) == set(json.loads(coverage)))}
+                self.db.executemany('UPDATE findings SET active=0 WHERE gid=? AND blob=?',
+                                    ((gid, blob) for blob in resolved))
+                coverage = json.dumps(sorted(completed))
                 new = 0
                 for blob, status in findings.items():
                     new += blob not in previous
-                    self.db.execute('''INSERT INTO findings VALUES(?,?,?,?,1,?)
-                        ON CONFLICT(gid,blob) DO UPDATE SET last_seen=excluded.last_seen,active=1,status=excluded.status''',
-                                    (gid, blob, now, now, status))
+                    self.db.execute('''INSERT INTO findings(gid,blob,first_seen,last_seen,active,status,coverage)
+                        VALUES(?,?,?,?,1,?,?) ON CONFLICT(gid,blob) DO UPDATE SET
+                        last_seen=excluded.last_seen,active=1,status=excluded.status,coverage=excluded.coverage''',
+                                    (gid, blob, now, now, status, coverage))
+                unresolved = len((previous.keys() - resolved) | findings.keys())
                 result = {k: v for k, v in result.items() if k != 'findings'}
                 result.update(candidates=len(findings), new=new,
-                              disappeared=len(previous - findings.keys()) if comparable else 0)
+                              disappeared=len(resolved), unresolved=unresolved)
                 self.db.execute('''UPDATE groups SET last_scan=?,last_count=?,scans=scans+1,
                     new_total=new_total+? WHERE id=?''', (now, len(findings), new, gid))
-                delay = self.setting('retry' if findings else 'interval')
+                delay = self.setting('retry' if unresolved else 'interval')
                 if new:
                     LOG.warning('Group %s: %d new/reappeared candidates, %d total', gid, new, len(findings))
             else:
@@ -307,13 +315,14 @@ class Master:
                     sum(error IS NOT NULL) failed, sum(last_count) candidates_at_last_scans,
                     min(last_scan) oldest_scan, sum(scans) scans, sum(new_total) new_total
                     FROM groups''', (now,)).fetchone()))
-                stats['workers_alive'] = self.db.execute('SELECT count(*) FROM workers WHERE seen>?',
-                                                        (now - self.args.lease,)).fetchone()[0]
-                stats['stale_inventory_groups'] = self.db.execute('SELECT count(*) FROM groups WHERE seen<?',
-                                                                (now - self.args.refresh * 2,)).fetchone()[0]
+                stats['workers_alive'] = self.db.execute(
+                    'SELECT count(*) FROM workers WHERE seen>?', (now - self.args.lease,)).fetchone()[0]
+                stats['stale_inventory_groups'] = self.db.execute(
+                    'SELECT count(*) FROM groups WHERE seen<?', (now - self.args.refresh * 2,)).fetchone()[0]
                 stats['unresolved_findings'] = self.db.execute('SELECT count(*) FROM findings WHERE active=1').fetchone()[0]
-                stats['scans_with_missing_vdisks'] = sum(bool(json.loads(r[0]).get('missing_vdisks'))
-                                                        for r in self.db.execute('SELECT last_result FROM groups WHERE last_result IS NOT NULL'))
+                stats['scans_with_missing_vdisks'] = sum(
+                    bool(json.loads(r[0]).get('missing_vdisks'))
+                    for r in self.db.execute('SELECT last_result FROM groups WHERE last_result IS NOT NULL'))
                 if stats['oldest_scan'] is not None:
                     stats['oldest_scan_age_seconds'] = round(now - stats.pop('oldest_scan'))
                 return json.dumps(stats, indent=2)
@@ -453,8 +462,7 @@ def scan(args, job, directory, cancel):
             except Exception as exc:
                 errors[futures[future]] = str(exc)
     check_running(cancel)
-    realms = [r for r in range(3) if all(r * 3 + d in good for d in range(3))]
-    if len(realms) < 2:
+    if not has_two_complete_realms(good):
         raise RuntimeError('Need two complete realms; completed=%s errors=%s' % (sorted(good), errors))
     # Reproduce dstool take-snapshot framing without interpreting VDisk metadata.
     snapshot = directory / 'snapshot'
@@ -472,7 +480,7 @@ def run_blobsan(args, gid, directory, cancel):
     check_running(cancel)
     report = directory / 'blobsan.err'
     with (directory / 'snapshot').open('rb') as inp, report.open('wb') as err:
-        process = subprocess.Popen([str(Path(args.blobsan).expanduser()), 'mirror-3-dc'],
+        process = subprocess.Popen([args.blobsan, 'mirror-3-dc'],
                                    stdin=inp, stdout=subprocess.DEVNULL, stderr=err)
         try:
             deadline = time.monotonic() + args.scan_timeout
@@ -631,4 +639,3 @@ def positive(value):
     if value <= 0:
         raise argparse.ArgumentTypeError('Must be positive')
     return value
-

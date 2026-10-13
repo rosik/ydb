@@ -1,4 +1,6 @@
+import io
 import json
+import os
 from pathlib import Path
 import socket
 import tempfile
@@ -8,9 +10,12 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from ydb.apps.dstool import main as cli
 from ydb.apps.dstool.lib import write2x2_service as svc
-from ydb.apps.dstool.lib import commands
+from ydb.apps.dstool.lib import commands, common
+from ydb.apps.dstool.lib import dstool_cmd_cluster_write2x2service as service_command
 from ydb.apps.dstool.lib.arg_parser import ArgumentParser
+from ydb.core.protos import blobstorage_config_pb2 as bsconfig
 
 
 BLOB = '[42:7:258:3:5:4096:0]'
@@ -64,6 +69,38 @@ class TestMaster(unittest.TestCase):
         self.master.console('pause')
         self.assertEqual(json.loads(self.master.console('stats'))['paused'], '1')
 
+    def test_discovery_assigns_dynamic_group_from_protobuf(self):
+        gid = 0x80000001
+        base = bsconfig.TBaseConfig()
+        group = base.Group.add(GroupId=gid, GroupGeneration=7, ErasureSpecies='mirror-3-dc',
+                               BoxId=1, StoragePoolId=2)
+        for index in range(9):
+            slot_id = group.VSlotId.add(NodeId=11 + index, PDiskId=1, VSlotId=100 + index)
+            slot = base.VSlot.add(GroupId=gid, GroupGeneration=7, FailRealmIdx=index // 3,
+                                  FailDomainIdx=index % 3, VDiskIdx=0)
+            slot.VSlotId.CopyFrom(slot_id)
+        base.Group.add(GroupId=gid + 1, ErasureSpecies='block-4-2')
+        virtual = base.Group.add(GroupId=gid + 2, ErasureSpecies='mirror-3-dc')
+        virtual.VirtualGroupInfo.SetInParent()
+        pool = bsconfig.TDefineStoragePool(BoxId=1, StoragePoolId=2, Name='dynamic-pool')
+        data = dict(BaseConfig=base, StoragePools=[pool])
+        with patch.object(common, 'fetch_base_config_and_storage_pools', return_value=data), \
+                patch.object(svc, 'view', return_value={}), \
+                patch.object(self.master.refresh, 'wait', side_effect=lambda *_: svc.STOP.set()):
+            try:
+                self.master.discover()
+            finally:
+                svc.STOP.clear()
+        self.assertEqual(json.loads(self.master.console('stats'))['discovery_error'], '')
+        self.assertEqual(json.loads(self.master.console('stats'))['groups'], 2)
+        self.claim('static-worker')
+        discovered = self.claim('dynamic-worker')['layout']
+        self.assertEqual(discovered['id'], gid)
+        self.assertEqual(discovered['generation'], 7)
+        self.assertEqual(discovered['pool'], 'dynamic-pool')
+        self.assertEqual([s['index'] for s in discovered['slots']], list(range(9)))
+        self.assertEqual([s['node'] for s in discovered['slots']], list(range(11, 20)))
+
     def test_expired_lease_rejects_old_results(self):
         old = self.claim()
         with self.master.db:
@@ -76,7 +113,7 @@ class TestMaster(unittest.TestCase):
         job = self.claim()
         self.assertTrue(self.result(job, {BLOB: 'request_ok'})['accepted'])
         self.assertTrue(self.result(job, {BLOB: 'request_ok'})['accepted'])
-        self.assertEqual(self.master.db.execute('SELECT scans FROM groups').fetchone()[0], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['scans'], 1)
         self.master.db.close()
         self.master = svc.Master(args(), self.directory)
         self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
@@ -103,11 +140,40 @@ class TestMaster(unittest.TestCase):
         self.result(self.claim(), {})
         self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
 
+    def test_repeated_changed_coverage_preserves_findings_after_restart(self):
+        self.result(self.claim(), {BLOB: 'request_ok'}, completed=list(range(6)))
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(3, 9)))
+        self.master.db.close()
+        self.master = svc.Master(args(), self.directory)
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(3, 9)))
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        row = self.master.db.execute('SELECT due,last_result FROM groups').fetchone()
+        self.assertAlmostEqual(row['due'] - time.time(), args().retry, delta=5)
+        self.assertEqual(json.loads(row['last_result'])['disappeared'], 0)
+        self.assertEqual(json.loads(row['last_result'])['unresolved'], 1)
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(6)))
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
+
+    def test_findings_resolved_only_against_their_own_coverage(self):
+        other_blob = '[42:7:259:3:5:4096:0]'
+        self.result(self.claim(), {BLOB: 'request_ok'}, completed=list(range(6)))
+        self.master.console('scan all')
+        self.result(self.claim(), {other_blob: 'absent'}, completed=list(range(3, 9)))
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(3, 9)))
+        active = [row[0] for row in self.master.db.execute('SELECT blob FROM findings WHERE active=1')]
+        self.assertEqual(active, [BLOB])
+        result = json.loads(self.master.db.execute('SELECT last_result FROM groups').fetchone()[0])
+        self.assertEqual(result['disappeared'], 1)
+
     def test_invalid_coverage_rolls_back(self):
         job = self.claim()
         with self.assertRaises(ValueError):
             self.result(job, {}, completed=[0, 1, 2])
-        self.assertEqual(self.master.db.execute('SELECT scans FROM groups').fetchone()[0], 0)
+        self.assertEqual(json.loads(self.master.console('stats'))['scans'], 0)
 
     def test_http_transport_and_auth(self):
         server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), svc.API)
@@ -212,6 +278,37 @@ class TestWorker(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
 
+    def test_relative_blobsan_runs_checked_executable(self):
+        binary = self.directory / 'blobsan'
+        binary.write_text('#!/bin/sh\n'
+                          '[ "$1" = mirror-3-dc ] || exit 2\n'
+                          'IFS= read -r snapshot\n'
+                          '[ "$snapshot" = "opaque snapshot bytes" ] || exit 3\n'
+                          "printf '%s\\n' 'GroupId# 1 BlobId# " + BLOB + "' >&2\n")
+        binary.chmod(0o700)
+        (self.directory / 'snapshot').write_bytes(b'opaque snapshot bytes\n')
+        decoy_dir = self.directory / 'bin'
+        decoy_dir.mkdir()
+        decoy = decoy_dir / 'blobsan'
+        decoy.write_text('#!/bin/sh\nexit 99\n')
+        decoy.chmod(0o700)
+
+        def work(parsed, directory):
+            self.assertEqual(parsed.blobsan, str(binary.resolve()))
+            self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), {BLOB})
+
+        previous_cwd = Path.cwd()
+        try:
+            os.chdir(self.directory)
+            with patch.dict(os.environ, {'PATH': str(decoy_dir)}), \
+                    patch.object(common, 'connection_params', common.ConnectionParams()), \
+                    patch.object(svc, 'work', side_effect=work) as worker:
+                service_command.do(args(write2x2_action='worker', dry_run=False,
+                                        blobsan='./blobsan', db=str(self.directory / 'db')))
+                worker.assert_called_once()
+        finally:
+            os.chdir(previous_cwd)
+
     def test_scan_six_streams_and_reject_partial_second_realm(self):
         def run(failed):
             counts = {}
@@ -281,6 +378,40 @@ class TestWorker(unittest.TestCase):
 
 
 class TestCLI(unittest.TestCase):
+    def setUp(self):
+        version = patch.object(cli, 'get_version', return_value='test')
+        version.start()
+        self.addCleanup(version.stop)
+
+    def test_service_endpoint_default_and_explicit_spellings(self):
+        for action, tail in [('master', ['--console-sock', '/tmp/socket']),
+                             ('worker', ['--master', 'host:22570'])]:
+            command = ['cluster', 'write2x2service', action, '--db', '/tmp/db'] + tail
+            for endpoints, expected in [([], ['localhost']),
+                                        (['-eremote.example'], ['remote.example']),
+                                        (['-e', 'remote.example'], ['remote.example']),
+                                        (['--endpoint', 'remote.example'], ['remote.example']),
+                                        (['--endpoint=remote.example'], ['remote.example']),
+                                        (['-efirst.example', '-esecond.example'], ['first.example', 'second.example'])]:
+                argv = endpoints + command
+                with self.subTest(argv=argv), \
+                        patch.object(common, 'connection_params', common.ConnectionParams()), \
+                        patch.object(common, 'apply_args'), patch.object(commands, 'run_command') as run:
+                    cli.main(argv)
+                    parsed = run.call_args.args[1]
+                    self.assertEqual(parsed.endpoint, expected)
+                    self.assertEqual(svc.viewer_url(parsed), 'http://' + expected[0] + ':8765')
+
+    def test_other_commands_still_require_endpoint(self):
+        with patch.object(common, 'apply_args') as apply_args, \
+                patch.object(commands, 'run_command') as run, \
+                patch('sys.stderr', new_callable=io.StringIO), patch('sys.stdout', new_callable=io.StringIO), \
+                self.assertRaises(SystemExit) as error:
+            cli.main(['cluster', 'list'])
+        self.assertEqual(error.exception.code, 1)
+        apply_args.assert_not_called()
+        run.assert_not_called()
+
     def test_commands_parse(self):
         for tail in (['master', '-l', '22570', '--db', '/tmp/master', '--console-sock', '/tmp/socket'],
                      ['worker', '--master', 'host:22570', '--db', '/tmp/worker']):
