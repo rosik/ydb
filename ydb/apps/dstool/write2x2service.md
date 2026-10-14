@@ -104,7 +104,10 @@ stops new repair requests; an already issued request cannot be revoked in
 `master --refresh` controls topology discovery (300 seconds). Stale inventory
 older than twice this interval is not assigned. Generation changes invalidate
 old jobs. Workers verify group generation before scanning, before repairs and
-after repairs. The configured geometry must be 3 realms x 3 domains x 1 VDisk.
+after repairs. Each check makes a fresh Viewer request limited to the group's
+storage nodes (`node_id`), with the response filtered by `GroupID`. No global
+whiteboard query is used for these checks. The configured geometry must be
+3 realms x 3 domains x 1 VDisk.
 Static groups are discovered through Viewer; an unavailable static VDisk may
 be absent from that inventory. Dynamic virtual/blob-depot groups are excluded.
 

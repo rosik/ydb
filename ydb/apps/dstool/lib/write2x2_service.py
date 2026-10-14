@@ -513,8 +513,14 @@ def run_blobsan(args, gid, directory, cancel):
 
 
 def validate_layout(args, job):
-    layout, base = job['layout'], viewer_url(args)
-    groups = ydb_http(args, base + '/viewer/json/bsgroupinfo').get('BSGroupStateInfo', [])
+    layout = job['layout']
+    nodes = sorted({s['node'] for s in layout['slots']})
+    if not nodes:
+        raise ValueError('No group nodes to verify generation')
+    # Query only this group's storage nodes on every check. Filter by ID, not
+    # generation: a newer generation must remain visible in the response.
+    groups = view(args, 'viewer/json/bsgroupinfo', node_id=','.join(map(str, nodes)),
+                  filter='GroupID=%d' % layout['id']).get('BSGroupStateInfo', [])
     groups = [g for g in groups if int(g['GroupID']) == layout['id']]
     group = max(groups, key=lambda g: int(g['GroupGeneration'])) if groups else None
     if group is None or int(group['GroupGeneration']) != layout['generation']:

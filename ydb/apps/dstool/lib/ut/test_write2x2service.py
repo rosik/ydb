@@ -149,7 +149,7 @@ class TestMaster(unittest.TestCase):
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
         self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
-        row = self.master.db.execute('SELECT due,last_result FROM groups').fetchone()
+        row = json.loads(self.master.console('groups'))
         self.assertAlmostEqual(row['due'] - time.time(), args().retry, delta=5)
         self.assertEqual(json.loads(row['last_result'])['disappeared'], 0)
         self.assertEqual(json.loads(row['last_result'])['unresolved'], 1)
@@ -164,9 +164,9 @@ class TestMaster(unittest.TestCase):
         self.result(self.claim(), {other_blob: 'absent'}, completed=list(range(3, 9)))
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
-        active = [row[0] for row in self.master.db.execute('SELECT blob FROM findings WHERE active=1')]
+        active = [json.loads(line)['blob'] for line in self.master.console('findings 1').splitlines()]
         self.assertEqual(active, [BLOB])
-        result = json.loads(self.master.db.execute('SELECT last_result FROM groups').fetchone()[0])
+        result = json.loads(json.loads(self.master.console('groups'))['last_result'])
         self.assertEqual(result['disappeared'], 1)
 
     def test_invalid_coverage_rolls_back(self):
@@ -214,11 +214,15 @@ class TestMaster(unittest.TestCase):
     def test_worker_repairs_then_verifies_over_http(self):
         repaired, reports = False, []
         sequences = {}
+        generation_checks = []
 
         def ydb(_args, url, raw=False):
             nonlocal repaired
             parsed = svc.urllib.parse.urlsplit(url)
             if parsed.path.endswith('bsgroupinfo'):
+                self.assertEqual(svc.urllib.parse.parse_qs(parsed.query),
+                                 {'node_id': ['1,2,3,4,5,6,7,8,9'], 'filter': ['GroupID=1']})
+                generation_checks.append((len(sequences), repaired))
                 return {'BSGroupStateInfo': [{'GroupID': 1, 'GroupGeneration': 1, 'ErasureSpecies': 'mirror-3-dc'}]}
             if parsed.path.endswith('tenantinfo'):
                 return {'TenantInfo': []}
@@ -263,6 +267,9 @@ class TestMaster(unittest.TestCase):
             self.assertEqual(reports[0]['findings'], {BLOB: 'request_ok'})
             self.assertEqual(reports[1]['findings'], {})
             self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
+            self.assertEqual(generation_checks, [
+                (0, False), (9, False), (9, True), (9, True), (18, True), (18, True),
+            ])
         finally:
             timer.cancel()
             server.shutdown()
@@ -277,6 +284,39 @@ class TestWorker(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
+
+    def test_generation_check_is_scoped_and_fresh(self):
+        for gid in (1, 0x80000001):
+            job = {'layout': layout(gid, [3, 1, 2, 3, 1, 2, 3, 1, 2])}
+            current = dict(GroupID=gid, GroupGeneration=1, ErasureSpecies='mirror-3-dc')
+            newer = dict(current, GroupGeneration=2)
+            with self.subTest(gid=gid), patch.object(svc, 'ydb_http', side_effect=[
+                {'BSGroupStateInfo': [current]}, {'BSGroupStateInfo': [current, newer]},
+            ]) as fetch:
+                svc.validate_layout(args(), job)
+                with self.assertRaisesRegex(ValueError, 'generation changed'):
+                    svc.validate_layout(args(), job)
+                self.assertEqual(fetch.call_count, 2)
+                for call in fetch.call_args_list:
+                    parsed = svc.urllib.parse.urlsplit(call.args[1])
+                    self.assertEqual(parsed.path, '/viewer/json/bsgroupinfo')
+                    self.assertEqual(svc.urllib.parse.parse_qs(parsed.query),
+                                     {'node_id': ['1,2,3'], 'filter': ['GroupID=%d' % gid]})
+
+    def test_generation_check_rejects_missing_or_incompatible_group(self):
+        current = dict(GroupID=1, GroupGeneration=1, ErasureSpecies='mirror-3-dc')
+        for response in ({}, {'Error': 'unavailable'}, {'BSGroupStateInfo': [dict(current, GroupID=2)]},
+                         {'BSGroupStateInfo': [dict(current, GroupGeneration=0)]},
+                         {'BSGroupStateInfo': [dict(current, ErasureSpecies='block-4-2')]}):
+            with self.subTest(response=response), patch.object(svc, 'ydb_http', return_value=response):
+                with self.assertRaises(ValueError):
+                    svc.validate_layout(args(), {'layout': layout()})
+        item = layout()
+        item['slots'] = []
+        with patch.object(svc, 'ydb_http') as fetch:
+            with self.assertRaisesRegex(ValueError, 'No group nodes'):
+                svc.validate_layout(args(), {'layout': item})
+            fetch.assert_not_called()
 
     def test_relative_blobsan_runs_checked_executable(self):
         binary = self.directory / 'blobsan'
