@@ -23,7 +23,7 @@ def positive(value):
 def add_options(parser):
     sub = parser.add_subparsers(dest='write2x2_action', required=True)
     master = sub.add_parser('master', help='Coordinator with SQLite state and Unix console')
-    master.add_argument('-l', '--listen', type=positive, default=22570)
+    master.add_argument('--listen', '-l', type=positive, default=22570)
     master.add_argument('--bind', default='0.0.0.0')
     master.add_argument('--console-sock', required=True)
     master.add_argument('--interval', type=positive, default=3600, help='Rescan clean groups after this many seconds')
@@ -50,16 +50,24 @@ def do(args):
     from ydb.apps.dstool.lib import write2x2_service as svc
 
     if args.dry_run:
-        raise ValueError('write2x2service does not support --dry-run')
+        raise common.InvalidParameterError(
+            common.connection_params.parser, '--dry-run', True,
+            'write2x2service does not support --dry-run')
     if args.write2x2_action == 'worker' and not 0 <= args.repair_delay <= 3600:
-        raise ValueError('--repair-delay must be in [0, 3600]')
+        raise common.InvalidParameterError(
+            common.connection_params.parser, '--repair-delay', args.repair_delay,
+            'Must be in [0, 3600]')
     if args.write2x2_action == 'worker':
         binary = Path(args.blobsan).expanduser().resolve()
         if not binary.is_file() or not os.access(binary, os.X_OK):
-            raise ValueError('blobsan is not an executable file: ' + str(binary))
+            raise common.InvalidParameterError(
+                common.connection_params.parser, '--blobsan', args.blobsan,
+                'Not an executable file: ' + str(binary))
         args.blobsan = str(binary)
     if args.write2x2_action == 'master' and args.listen > 65535:
-        raise ValueError('Invalid listen port')
+        raise common.InvalidParameterError(
+            common.connection_params.parser, '--listen', args.listen,
+            'Port must be in [1, 65535]')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     directory = Path(args.db).expanduser()
     directory.mkdir(parents=True, exist_ok=True)
