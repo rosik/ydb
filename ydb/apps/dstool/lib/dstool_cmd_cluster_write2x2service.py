@@ -37,6 +37,7 @@ def add_options(parser):
     worker.add_argument('--poll', type=positive, default=5)
     worker.add_argument('--heartbeat', type=positive, default=20, help='Must be shorter than master lease')
     worker.add_argument('--repair-delay', type=float, default=0.0, help='Seconds between repair requests')
+    worker.add_argument('--scan-only', action='store_true', help='Report layouts without issuing repair requests')
     for p in (master, worker):
         p.add_argument('--db', required=True, help='Persistent local state directory')
         p.add_argument('--viewer', help='Viewer URL; defaults to this process endpoint/monitoring port')

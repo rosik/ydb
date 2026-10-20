@@ -8,6 +8,7 @@ import hmac
 from http import server as http_server
 import json
 import logging
+import math
 import os
 from pathlib import Path
 
@@ -22,11 +23,12 @@ import struct
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 
-from ydb.apps.dstool.lib import common
+from ydb.apps.dstool.lib import common, write2x2_report
 
 
 LOG = logging.getLogger('w2x2')
@@ -41,6 +43,11 @@ def encode(value):
 
 def has_two_complete_realms(indexes):
     return sum(all(r * 3 + d in indexes for d in range(3)) for r in range(3)) >= 2
+
+
+def pool_identity(layout):
+    # Older persisted inventory has only names, which need not be unique across boxes.
+    return layout.get('pool_key') or ('static' if layout['id'] < 0x80000000 else 'unknown:%d' % layout['id'])
 
 
 def atomic_json(path, value):
@@ -71,11 +78,22 @@ def token_headers():
 
 def http(url, headers=None, data=None, timeout=30, raw=False, context=None):
     req = urllib.request.Request(url, data=None if data is None else encode(data), headers=headers or {})
-    with urllib.request.urlopen(req, timeout=timeout, context=context) as response:
-        body = response.read(MAX_BODY + 1)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=context) as response:
+            body = response.read(MAX_BODY + 1)
+    except urllib.error.HTTPError as exc:
+        # urlopen raises before entering the context manager. HTTPError owns
+        # the response body, which can otherwise keep a socket alive until GC.
+        exc.close()
+        raise
     if len(body) > MAX_BODY:
         raise ValueError('HTTP response exceeds 128 MiB')
     return body if raw else json.loads(body)
+
+
+def log_failure(message, exc, *args):
+    reason = exc.reason if isinstance(exc, urllib.error.URLError) and not isinstance(exc, urllib.error.HTTPError) else exc
+    LOG.error(message + ': %s', *args, ' '.join(str(reason).split()), exc_info=LOG.isEnabledFor(logging.DEBUG))
 
 
 def viewer_url(args):
@@ -111,7 +129,8 @@ def topology(args):
         if row.ErasureSpecies != 'mirror-3-dc' or row.HasField('VirtualGroupInfo'):
             continue
         group = dict(id=row.GroupId, generation=row.GroupGeneration,
-                     pool=pools.get((row.BoxId, row.StoragePoolId)), slots=[])
+                     pool=pools.get((row.BoxId, row.StoragePoolId)),
+                     pool_key='%d:%d' % (row.BoxId, row.StoragePoolId), slots=[])
         for id_ in row.VSlotId:
             slot = slots[id_.NodeId, id_.PDiskId, id_.VSlotId]
             if slot.GroupId != row.GroupId or slot.GroupGeneration != row.GroupGeneration:
@@ -130,7 +149,7 @@ def topology(args):
             gid, generation = int(info['GroupID']), int(info['GroupGeneration'])
             if gid in groups:
                 continue
-            group = dict(id=gid, generation=generation, pool='static', slots=[])
+            group = dict(id=gid, generation=generation, pool='static', pool_key='static', slots=[])
             for row in rows:
                 v = row.get('VDiskId', {})
                 if int(v.get('GroupID', -1)) != gid or int(v.get('GroupGeneration', -1)) != generation or row.get('DonorMode'):
@@ -144,7 +163,7 @@ def topology(args):
     for group in groups.values():
         group['slots'].sort(key=lambda s: s['index'])
         indexes = [s['index'] for s in group['slots']]
-        minimum = 6 if group['pool'] == 'static' else 9
+        minimum = 1 if group['pool_key'] == 'static' else 9
         if len(indexes) < minimum or len(set(indexes)) != len(indexes) or any(i not in range(9) for i in indexes):
             raise ValueError('Incomplete/ambiguous layout for group %s' % group['id'])
         group['fingerprint'] = hashlib.sha256(encode(group)).hexdigest()
@@ -172,6 +191,9 @@ class Master:
             CREATE TABLE IF NOT EXISTS findings(
                 gid INTEGER, blob TEXT, first_seen REAL, last_seen REAL, active INTEGER,
                 status TEXT, coverage TEXT NOT NULL, PRIMARY KEY(gid,blob));
+            CREATE TABLE IF NOT EXISTS scan_reports(
+                gid INTEGER PRIMARY KEY, generation INTEGER, fingerprint TEXT,
+                started REAL, finished REAL, result TEXT);
         ''')
         for key, value in [('paused', 0), ('interval', args.interval), ('retry', args.retry)]:
             self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', (key, str(value)))
@@ -255,13 +277,22 @@ class Master:
                         not re.fullmatch(r'\[(?:\d+:){6}0\]', b) or not isinstance(s, str) for b, s in findings.items()):
                     raise ValueError('Invalid findings')
                 completed = result['completed_vdisks']
-                if not isinstance(completed, list) or any(i not in range(9) for i in completed) or len(set(completed)) != len(completed):
+                if not isinstance(completed, list) or any(type(i) is not int or i not in range(9) for i in completed) or len(set(completed)) != len(completed):
                     raise ValueError('Invalid coverage')
-                if not has_two_complete_realms(completed):
+                report = result.get('scan_report')
+                if report is not None:
+                    write2x2_report.validate(report, gid, completed)
+                    started, finished = result['started_at'], result['finished_at']
+                    if any(type(t) not in (int, float) or not math.isfinite(t) for t in (started, finished)) or started > finished:
+                        raise ValueError('Invalid scan timestamps')
+                findings_complete = result.get('findings_complete', True)
+                if type(findings_complete) is not bool or (not findings_complete and (report is None or findings)):
+                    raise ValueError('Invalid candidate scan status')
+                if not completed or (findings_complete and not has_two_complete_realms(completed)):
                     raise ValueError('Incomplete scan')
                 previous = {r['blob']: r['coverage'] for r in self.db.execute(
                     'SELECT blob,coverage FROM findings WHERE gid=? AND active=1', (gid,))}
-                resolved = {blob for blob, coverage in previous.items() if blob not in findings and
+                resolved = {blob for blob, coverage in previous.items() if findings_complete and blob not in findings and
                             (len(completed) == 9 or set(completed) == set(json.loads(coverage)))}
                 self.db.executemany('UPDATE findings SET active=0 WHERE gid=? AND blob=?',
                                     ((gid, blob) for blob in resolved))
@@ -275,11 +306,16 @@ class Master:
                                     (gid, blob, now, now, status, coverage))
                 unresolved = len((previous.keys() - resolved) | findings.keys())
                 result = {k: v for k, v in result.items() if k != 'findings'}
-                result.update(candidates=len(findings), new=new,
+                result.update(candidates=len(findings) if findings_complete else None, new=new,
                               disappeared=len(resolved), unresolved=unresolved)
                 self.db.execute('''UPDATE groups SET last_scan=?,last_count=?,scans=scans+1,
-                    new_total=new_total+? WHERE id=?''', (now, len(findings), new, gid))
-                delay = self.setting('retry' if unresolved else 'interval')
+                    new_total=new_total+? WHERE id=?''', (now, result['candidates'], new, gid))
+                if report is not None:
+                    layout = json.loads(row['layout'])
+                    self.db.execute('''INSERT OR REPLACE INTO scan_reports
+                        VALUES(?,?,?,?,?,?)''', (gid, layout['generation'], layout['fingerprint'],
+                                               started, finished, json.dumps(result)))
+                delay = self.setting('retry' if unresolved or len(completed) < 9 else 'interval')
                 if new:
                     LOG.warning('Group %s: %d new/reappeared candidates, %d total', gid, new, len(findings))
             else:
@@ -288,6 +324,62 @@ class Master:
             self.db.execute('''UPDATE groups SET token=NULL,expires=0,last_token=?,due=?,
                 last_result=?,error=? WHERE id=?''', (lease, now + delay, json.dumps(result), error, gid))
             return {'accepted': True}
+
+    def layouts(self, gid, now):
+        row = self.db.execute('''SELECT g.layout,g.seen,g.error,s.* FROM groups g
+            LEFT JOIN scan_reports s ON s.gid=g.id WHERE g.id=?''', (gid,)).fetchone()
+        if row is None:
+            raise ValueError('Unknown group')
+        layout = json.loads(row['layout'])
+        result = dict(group_id=gid, generation=layout['generation'], pool=layout.get('pool'),
+                      pool_key=pool_identity(layout), latest_error=row['error'],
+                      inventory_stale=row['seen'] < now - self.args.refresh * 2)
+        if row['result'] is None:
+            return dict(result, scan_report=None)
+        result.update(json.loads(row['result']))
+        result.update(report_generation=row['generation'],
+                      outdated=row['fingerprint'] != layout['fingerprint'] or row['generation'] != layout['generation'],
+                      scan_age_seconds=max(0, round(now - row['finished'])))
+        return result
+
+    def pools(self, selector, now):
+        pools = {}
+        rows = self.db.execute('''SELECT g.id,g.layout,g.seen,g.error,s.generation,s.fingerprint,
+            s.finished,s.result FROM groups g LEFT JOIN scan_reports s ON s.gid=g.id''')
+        for row in rows:
+            layout = json.loads(row['layout'])
+            key = pool_identity(layout)
+            name = layout.get('pool')
+            if selector is not None and selector not in (key, name):
+                continue
+            pool = pools.setdefault(key, dict(pool_key=key, pool=name, groups=0, reported_groups=0,
+                full_groups=0, partial_groups=0, never_scanned_groups=0, outdated_groups=0,
+                stale_inventory_groups=0, failed_groups=0, oldest_scan=None, newest_scan=None, histogram={}))
+            pool['groups'] += 1
+            pool['failed_groups'] += bool(row['error'])
+            if row['seen'] < now - self.args.refresh * 2:
+                pool['stale_inventory_groups'] += 1
+                continue
+            if row['result'] is None:
+                pool['never_scanned_groups'] += 1
+                continue
+            if row['fingerprint'] != layout['fingerprint'] or row['generation'] != layout['generation']:
+                pool['outdated_groups'] += 1
+                continue
+            report = json.loads(row['result'])['scan_report']
+            pool['reported_groups'] += 1
+            pool['full_groups' if len(report['completed_vdisks']) == 9 else 'partial_groups'] += 1
+            for field, func in (('oldest_scan', min), ('newest_scan', max)):
+                pool[field] = row['finished'] if pool[field] is None else func(pool[field], row['finished'])
+            write2x2_report.merge(pool['histogram'], report['buckets'])
+        results = []
+        for key in sorted(pools, key=lambda key: str(key)):
+            pool = pools[key]
+            pool['buckets'] = write2x2_report.histogram_rows(pool.pop('histogram'))
+            pool['totals'] = write2x2_report.totals(pool['buckets'])
+            pool['oldest_scan_age_seconds'] = None if pool['oldest_scan'] is None else max(0, round(now - pool['oldest_scan']))
+            results.append(pool)
+        return results
 
     def console(self, command):
         words = shlex.split(command)
@@ -307,6 +399,10 @@ class Master:
                     self.db.execute('UPDATE groups SET due=0 WHERE id=?', (int(words[1]),))
             elif op == 'refresh':
                 self.refresh.set()
+            elif op == 'layouts':
+                return json.dumps(self.layouts(int(words[1]), time.time()), indent=2)
+            elif op == 'pools':
+                return json.dumps(self.pools(words[1] if len(words) > 1 else None, time.time()), indent=2)
             elif op == 'stats':
                 now = time.time()
                 stats = dict(self.db.execute('SELECT key,value FROM settings'))
@@ -337,7 +433,7 @@ class Master:
                     query, values = ('SELECT * FROM findings WHERE active=1 LIMIT 1000', ())
                 return '\n'.join(json.dumps(dict(r)) for r in self.db.execute(query, values)) or '(empty)'
             elif op == 'help':
-                return 'stats | groups | workers | findings [GROUP] (max 1000) | pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit'
+                return 'stats | groups | layouts GROUP | pools [POOL] | workers | findings [GROUP] (max 1000) | pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit'
             else:
                 raise ValueError('Unknown command; use help')
         return 'OK'
@@ -431,8 +527,15 @@ def check_running(cancel):
         raise RuntimeError('Stopped or lost master lease')
 
 
+class ScanError(RuntimeError):
+    def __init__(self, message, coverage):
+        super().__init__(message)
+        self.coverage = coverage
+
+
 def scan(args, job, directory, cancel):
     layout, base = job['layout'], viewer_url(args)
+    started = time.time()
     deadline = time.monotonic() + args.scan_timeout
 
     def fetch(slot):
@@ -462,8 +565,10 @@ def scan(args, job, directory, cancel):
             except Exception as exc:
                 errors[futures[future]] = str(exc)
     check_running(cancel)
-    if not has_two_complete_realms(good):
-        raise RuntimeError('Need two complete realms; completed=%s errors=%s' % (sorted(good), errors))
+    coverage = dict(completed_vdisks=sorted(good), missing_vdisks=sorted(set(range(9)) - set(good)),
+                    stream_errors=errors, started_at=started)
+    if not good:
+        raise ScanError('No complete VDisk streams', coverage)
     # Reproduce dstool take-snapshot framing without interpreting VDisk metadata.
     snapshot = directory / 'snapshot'
     with snapshot.open('wb') as out:
@@ -471,16 +576,30 @@ def scan(args, job, directory, cancel):
             check_running(cancel)
             with (directory / ('slot-%d' % index)).open('rb') as inp:
                 shutil.copyfileobj(inp, out)
-    candidates = run_blobsan(args, layout['id'], directory, cancel)
-    return candidates, dict(completed_vdisks=sorted(good), missing_vdisks=sorted(set(range(9)) - set(good)), stream_errors=errors)
+    atomic_json(directory / 'manifest.json', dict(group_id=layout['id'], completed_vdisks=sorted(good)))
+    try:
+        candidates, report = run_blobsan(args, layout['id'], directory, cancel)
+    except Exception as exc:
+        raise ScanError(str(exc), coverage) from exc
+    coverage.update(scan_report=report, finished_at=time.time())
+    return candidates, coverage
 
 
 def run_blobsan(args, gid, directory, cancel):
     """The supplied executable alone decides which blobs need repair."""
     check_running(cancel)
     report = directory / 'blobsan.err'
+    manifest_path = (directory / 'manifest.json').resolve()
+    manifest = json.loads(manifest_path.read_text())
+    statistics_path = (directory / 'report.json').resolve()
+    statistics_path.unlink(missing_ok=True)
+    command = [args.blobsan, '--write2x2-candidates', '--scan-manifest', str(manifest_path),
+               '--scan-report', str(statistics_path)]
+    if args.scan_only or not has_two_complete_realms(manifest['completed_vdisks']):
+        command.append('--scan-only')
+    command.append('mirror-3-dc')
     with (directory / 'snapshot').open('rb') as inp, report.open('wb') as err:
-        process = subprocess.Popen([args.blobsan, '--write2x2-candidates', 'mirror-3-dc'],
+        process = subprocess.Popen(command,
                                    stdin=inp, stdout=subprocess.DEVNULL, stderr=err)
         try:
             deadline = time.monotonic() + args.scan_timeout
@@ -500,6 +619,7 @@ def run_blobsan(args, gid, directory, cancel):
                     process.kill()
                     process.wait()
     check_running(cancel)
+    statistics = write2x2_report.validate(json.loads(statistics_path.read_text()), gid, manifest['completed_vdisks'])
     candidates = set()
     with report.open(errors='replace') as inp:
         for line in inp:
@@ -509,7 +629,7 @@ def run_blobsan(args, gid, directory, cancel):
             if not match or int(match[1]) != gid or match[2].split(':')[-1] != '0]':
                 raise ValueError('Unrecognized blobsan candidate: ' + line[:200])
             candidates.add(match[2])
-    return candidates
+    return candidates, statistics
 
 
 def validate_layout(args, job):
@@ -617,26 +737,29 @@ def work(args, directory):
                 validate_layout(args, job)
                 candidates, coverage = scan(args, job, scratch, cancel)
                 validate_layout(args, job)
+                findings_complete = not args.scan_only and has_two_complete_realms(coverage['completed_vdisks'])
                 try:
-                    findings = repair(args, job, candidates, cancel)
+                    findings = repair(args, job, candidates, cancel) if findings_complete else {}
                 except Exception as exc:
                     check_running(cancel)
                     findings = {blob: 'failed: ' + str(exc)[:300] for blob in candidates}
                 check_running(cancel)
                 validate_layout(args, job)
-                result = dict(findings=findings, **coverage)
+                result = dict(findings=findings, findings_complete=findings_complete, **coverage)
                 result['repairs'] = dict(collections.Counter(s.split(':')[0] for s in findings.values()))
-                LOG.info('Group %s: %d candidates, repairs %s', gid, len(candidates), result['repairs'])
+                LOG.info('Group %s: %d observed blobs, candidates %s, repairs %s', gid,
+                         coverage['scan_report']['totals']['blobs'], len(candidates) if findings_complete else 'not evaluated',
+                         result['repairs'])
             except Exception as exc:
-                LOG.exception('Group %s failed', gid)
-                result = {'error': str(exc)}
+                log_failure('Group %s failed', exc, gid)
+                result = dict(getattr(exc, 'coverage', {}), error=str(exc))
             finally:
                 finished.set()
                 thread.join()
             result['seconds'] = round(time.monotonic() - started, 2)
             atomic_json(pending, dict(group=gid, token=lease, result=result))
-        except Exception:
-            LOG.exception('Worker operation failed; retrying')
+        except Exception as exc:
+            log_failure('Worker operation failed; retrying in %ss', exc, args.poll)
             STOP.wait(args.poll)
 
 

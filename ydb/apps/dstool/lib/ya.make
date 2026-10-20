@@ -8,6 +8,7 @@ PY_SRCS(
     common.py
     nbs_dbg_like_load.py
     write2x2_service.py
+    write2x2_report.py
     dstool_cmd_cluster_write2x2service.py
     dstool_cmd_cluster_workload_nbs_dbg_like.py
     grouptool.py

@@ -1,4 +1,4 @@
-# Continuous single-DC blob repair
+# Continuous blob layout scans and single-DC repair
 
 `dstool cluster write2x2service` runs outside `ydbd`. It discovers conventional
 `mirror-3-dc` groups, scans VDisk metadata, and issues `blob_range` requests with
@@ -12,6 +12,12 @@ installation, shared database, or new server code is required. The service uses
 Python's standard library and dstool's existing connection/configuration code.
 Master, worker, and the console require POSIX (Linux is the deployment target).
 
+Every successful scan produces a histogram of **all observed blobs**, before
+candidate filtering, including full layouts and GC metadata. Use worker
+`--scan-only` to collect these reports without issuing repair requests. Recovery
+continues to use the existing `mustRestoreFirst` behavior when that option is
+omitted; scans with fewer than two complete realms only publish observations.
+
 ## Start
 
 ```bash
@@ -21,6 +27,10 @@ dstool --token-file ~/.token cluster write2x2service master \
 # On each selected storage host:
 dstool --token-file ~/.token cluster write2x2service worker \
     --master master-host:22570 --db ~/w2x2_worker_db/ --blobsan ~/blobsan
+
+# Observation without repair:
+dstool --token-file ~/.token cluster write2x2service worker \
+    --master master-host:22570 --db ~/w2x2_observer_db/ --blobsan ~/blobsan --scan-only
 ```
 
 For this command only, an omitted `-e` defaults to `localhost`. Each process
@@ -65,6 +75,8 @@ or `socat - UNIX-CONNECT:/tmp/w2x2.sock`. Stats are printed on connection.
 |---|---|
 | `stats` | Discovery status, scans, candidate totals, unresolved findings, live workers, stale inventory and missing VDisks |
 | `groups` | Per-group scan time, candidate count, coverage, repair response counts, owner, scheduling and errors |
+| `layouts GROUP` | Last successful histogram with captured/missing VDisks, stream errors, scan timestamps, generation and latest attempt error |
+| `pools [POOL]` | Histograms summed over the latest reports per group; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
 | `workers` | Known workers and last contact timestamps |
 | `findings [GROUP]` | Up to 1000 unresolved candidates with last repair response |
 | `pause` / `resume` | Stop/resume assigning new jobs; running jobs finish |
@@ -91,7 +103,9 @@ Master SQLite stores topology, leases, schedules, findings and the latest
 summary per group. Workers persist their identity and unacknowledged report in
 their local directory. Compressed snapshot files for the last job remain in
 `DB/scan` and are replaced by the next job. The assembled input is `snapshot`;
-the analyzer's full stderr is `blobsan.err`. Resource usage depends on group
+the analyzer's full stderr is `blobsan.err`. `manifest.json` records the group
+and successfully completed streams, including empty streams; `report.json`
+contains the analyzer histogram. Resource usage depends on group
 size, the external analyzer and retained findings.
 
 Jobs have renewable leases (`master --lease`, default 120 seconds). Failed
@@ -110,7 +124,8 @@ storage nodes (`node_id`), with the response filtered by `GroupID`. No global
 whiteboard query is used for these checks. The configured geometry must be
 3 realms x 3 domains x 1 VDisk.
 Static groups are discovered through Viewer; an unavailable static VDisk may
-be absent from that inventory. Dynamic virtual/blob-depot groups are excluded.
+be absent from that inventory and is reported as missing. A static inventory
+with at least one VDisk is sufficient for an observation. Dynamic virtual/blob-depot groups are excluded.
 
 The API listens on all interfaces by default (`--bind` changes this). Use it on
 a trusted network. Optional `--secret-file` on master and workers enables
@@ -127,17 +142,22 @@ never retried because the server may already have advanced its cursor. The
 worker adds the same group/index/length framing as `dstool group take-snapshot`,
 without decoding the metadata payload.
 
-A pass requires three complete VDisk streams in each of at least two realms.
-The missing indexes and errors are recorded, even for an accepted pass. A
-six-VDisk scan is not a health certificate for all nine VDisks. Snapshots across
-VDisk are not atomic. Empty initial streams are valid empty indexes.
+An observation requires at least one complete VDisk stream. Partial streams
+are discarded; missing indexes and errors are recorded. With no complete
+streams, the attempt fails and preserves the previous report. Snapshots across
+VDisk are not atomic. Empty initial streams are valid empty indexes and are
+explicitly identified by the manifest. Candidate processing still requires
+three complete VDisk streams in each of at least two realms.
 
 The assembled snapshot is passed as stdin to
-`blobsan --write2x2-candidates mirror-3-dc`. Stdout goes
+`blobsan --write2x2-candidates --scan-manifest manifest.json --scan-report report.json mirror-3-dc`.
+`--scan-only` is also passed when repairs are disabled or candidate coverage is
+insufficient. Stdout goes
 to `/dev/null`, as in the original scripts (this also disables verbose output
 in blobsan). Stderr is saved and only `GroupId# ... BlobId# ...` lines are parsed.
 The supplied executable is the sole authority on candidate selection and
-snapshot payload validation. A nonzero exit, timeout, or malformed candidate
+snapshot payload validation. The service validates the JSON report's schema,
+coverage and histogram totals. A nonzero exit, timeout, or malformed candidate
 line fails the pass. The process is terminated on cancellation or lease loss.
 The service itself does not check ingress, GC barriers, or replication layout
 inside the snapshot. Transport completion plus analyzer success is not an
@@ -160,3 +180,64 @@ retried after another scan; there is no permanent processed-blob blacklist.
 
 No direct writes of blob contents are performed by the service: actual repair
 and GC/existence decisions remain in DSProxy through `mustRestoreFirst`.
+
+## Layout reports
+
+`layouts GROUP` includes `scan_report` version 1, with `group_id`,
+`completed_vdisks`, `buckets` and `totals`. Each bucket has `local`, `ingress`,
+`gc` and four counters:
+
+| Counter | Meaning |
+|---|---|
+| `blobs` | Unique BlobIds within the group, after merging duplicate index records |
+| `logical_bytes` | Sum of BlobSize once per blob |
+| `observed_replica_bytes` | Sum of BlobSize for every observed correctly placed local part |
+| `missing_metadata_blobs` | Blobs with no index record on at least one successfully captured VDisk |
+
+Both layout strings use **group failrealm order** (0, 1, 2), rather than the
+blob-dependent part/subgroup order. `local=1+1+?` means one copy in each of the
+first two realms and incomplete observation of the third. A realm is `?` when
+any of its three VDisks is missing, regardless of copies observed on its other
+VDisk(s). `0` means all three indexes were captured and no local part was found.
+`ingress` counts correctly placed parts known from merged ingress, including
+claims about unavailable VDisks. It is metadata knowledge, not confirmation of
+local data. Wrong-realm parts are not counted as replicas.
+
+Local counters are collected before applying GC discards to the local layout.
+GC states follow the existing analyzer's accepted barriers and merged flags,
+with the following precedence:
+
+| `gc` | Condition |
+|---|---|
+| `hard_barrier` | A covering hard barrier was observed |
+| `do_not_keep` | DoNotKeep is set |
+| `soft_without_keep` | A covering soft barrier was observed, without Keep |
+| `soft_with_keep` | A covering soft barrier was observed, with Keep |
+| `no_covering_barrier` | No accepted covering barrier was observed on captured indexes |
+
+These labels describe the observed metadata, not proof of current physical
+existence or completed garbage collection. In write2x2 mode the analyzer accepts
+barriers without quorum. Blobs excluded by candidate filters, including missing
+metadata and complete layouts, remain in the histogram. Blobs absent from every
+captured index cannot be inventoried; partial reports describe observed bytes.
+
+The master persists the latest successful report for each group independently
+of its latest attempt. Failure preserves that report and is shown as
+`latest_error`. Observation-only and insufficient-coverage scans do not close
+previous recovery findings or report zero recovery candidates.
+
+`pools` sums each group's latest histogram once. It reports `full_groups`,
+`partial_groups`, `never_scanned_groups`, `outdated_groups`,
+`stale_inventory_groups` and `failed_groups`, plus oldest/newest scan times.
+Reports whose group generation or topology fingerprint has changed are excluded,
+as are groups whose inventory is older than twice the discovery refresh interval.
+Other old reports remain visible with their timestamps, including after a failed
+attempt. Pool identity is BoxId/StoragePoolId, so identical pool names in
+different boxes stay separate. Failrealm positions are retained in pool buckets;
+they refer to group topology, not a global datacenter name.
+Cached dynamic inventory without pool IDs from older masters is kept separate
+per group under `unknown:GROUP` until topology discovery refreshes it.
+
+Rebuild both `dstool` and `blobsan` when upgrading to layout reports. Existing
+master databases gain the report table automatically; groups without reports
+are listed as never scanned until a reporting worker visits them.

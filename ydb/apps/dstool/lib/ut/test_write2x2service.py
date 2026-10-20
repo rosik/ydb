@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -9,10 +10,11 @@ import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+import warnings
 
 from ydb.apps.dstool import main as cli
 from ydb.apps.dstool.lib import write2x2_service as svc
-from ydb.apps.dstool.lib import commands, common
+from ydb.apps.dstool.lib import commands, common, write2x2_report
 from ydb.apps.dstool.lib import dstool_cmd_cluster_write2x2service as service_command
 from ydb.apps.dstool.lib.arg_parser import ArgumentParser
 from ydb.core.protos import blobstorage_config_pb2 as bsconfig
@@ -30,9 +32,17 @@ def layout(gid=1, nodes=None):
 def args(**kwargs):
     values = dict(interval=3600, retry=60, refresh=300, lease=120, viewer='http://localhost:8765',
                   endpoint=['localhost'], request_timeout=5, scan_timeout=30, repair_delay=0,
-                  master='unused', secret_file=None, poll=1, heartbeat=1)
+                  master='unused', secret_file=None, poll=1, heartbeat=1, scan_only=False)
     values.update(kwargs)
     return SimpleNamespace(**values)
+
+
+def scan_report(completed=tuple(range(9)), gid=1, blobs=1):
+    local = '+'.join('1' if all(r * 3 + d in completed for d in range(3)) else '?' for r in range(3))
+    buckets = [dict(local=local, ingress='1+1+1', gc='no_covering_barrier', blobs=blobs,
+                    logical_bytes=100 * blobs, observed_replica_bytes=300 * blobs, missing_metadata_blobs=0)] if blobs else []
+    return dict(version=1, group_id=gid, completed_vdisks=sorted(completed), buckets=buckets,
+                totals=write2x2_report.totals(buckets))
 
 
 class TestMaster(unittest.TestCase):
@@ -58,6 +68,93 @@ class TestMaster(unittest.TestCase):
         result = dict(findings=findings, completed_vdisks=completed,
                       missing_vdisks=sorted(set(range(9)) - set(completed)))
         return self.master.rpc('/result', dict(worker=worker, group=job['layout']['id'], token=job['token'], result=result))
+
+    def observation(self, job, completed=tuple(range(9)), blobs=1):
+        report = scan_report(completed, job['layout']['id'], blobs)
+        now = time.time()
+        result = dict(findings={}, findings_complete=False, scan_report=report,
+                      completed_vdisks=list(completed), missing_vdisks=sorted(set(range(9)) - set(completed)),
+                      started_at=now - 2, finished_at=now - 1)
+        body = dict(worker='one', group=job['layout']['id'], token=job['token'], result=result)
+        self.assertTrue(self.master.rpc('/result', body)['accepted'])
+        return body
+
+    def test_pool_uses_latest_group_reports_and_survives_restart(self):
+        self.add_group(layout(2, list(range(11, 20))))
+        job = self.claim()
+        body = self.observation(job, blobs=2)
+        self.master.rpc('/result', body)
+        self.observation(self.claim(), blobs=3)
+        pool, = json.loads(self.master.console('pools static'))
+        self.assertEqual(pool['totals']['blobs'], 5)
+        self.assertEqual(pool['full_groups'], 2)
+        self.master.console('scan 1')
+        self.observation(self.claim(), blobs=1)
+        self.master.db.close()
+        self.master = svc.Master(args(), self.directory)
+        pool, = json.loads(self.master.console('pools'))
+        self.assertEqual(pool['totals']['blobs'], 4)
+        self.assertEqual(pool['totals']['logical_bytes'], 400)
+
+    def test_observation_accepts_partial_coverage_and_preserves_findings(self):
+        self.result(self.claim(), {BLOB: 'request_ok'})
+        self.master.console('scan 1')
+        self.observation(self.claim(), completed=(0, 1))
+        pool, = json.loads(self.master.console('pools'))
+        self.assertEqual(pool['partial_groups'], 1)
+        self.assertEqual(pool['buckets'][0]['local'], '?+?+?')
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertIsNone(json.loads(self.master.console('layouts 1'))['candidates'])
+        self.master.console('scan 1')
+        self.observation(self.claim())
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+
+    def test_failed_attempt_preserves_previous_scan_report(self):
+        self.observation(self.claim())
+        self.master.console('scan 1')
+        job = self.claim()
+        self.master.rpc('/result', dict(worker='one', group=1, token=job['token'], result={'error': 'all disks unavailable'}))
+        detail = json.loads(self.master.console('layouts 1'))
+        self.assertEqual(detail['latest_error'], 'all disks unavailable')
+        self.assertEqual(detail['scan_report']['totals']['blobs'], 1)
+        pool, = json.loads(self.master.console('pools'))
+        self.assertEqual(pool['failed_groups'], 1)
+        self.assertEqual(pool['totals']['blobs'], 1)
+
+    def test_outdated_and_stale_inventory_reports_are_excluded(self):
+        self.observation(self.claim())
+        item = layout()
+        item.update(generation=2, fingerprint='v2')
+        with self.master.db:
+            self.master.db.execute('UPDATE groups SET layout=?', (json.dumps(item),))
+        pool, = json.loads(self.master.console('pools'))
+        self.assertEqual(pool['outdated_groups'], 1)
+        self.assertEqual(pool['totals']['blobs'], 0)
+        self.assertTrue(json.loads(self.master.console('layouts 1'))['outdated'])
+        with self.master.db:
+            self.master.db.execute('UPDATE groups SET seen=0')
+        pool, = json.loads(self.master.console('pools'))
+        self.assertEqual(pool['stale_inventory_groups'], 1)
+        self.assertEqual(pool['reported_groups'], 0)
+
+    def test_pool_identity_and_never_scanned_groups(self):
+        for gid, key in [(1, '1:2'), (2, '2:2')]:
+            item = dict(layout(gid, list(range(gid * 10, gid * 10 + 9))), pool='same-name', pool_key=key)
+            with self.master.db:
+                self.master.db.execute('INSERT OR REPLACE INTO groups(id,layout,seen) VALUES(?,?,?)',
+                                       (gid, json.dumps(item), time.time()))
+        self.observation(self.claim())
+        pools = json.loads(self.master.console('pools same-name'))
+        self.assertEqual(len(pools), 2)
+        self.assertEqual(pools[1]['never_scanned_groups'], 1)
+        self.assertEqual(json.loads(self.master.console('pools 1:2'))[0]['totals']['blobs'], 1)
+
+    def test_legacy_inventory_without_pool_ids_does_not_merge_dynamic_pool_names(self):
+        for gid in (0x80000001, 0x80000002):
+            self.add_group(dict(layout(gid), pool='same-name'))
+        pools = json.loads(self.master.console('pools same-name'))
+        self.assertEqual([pool['pool_key'] for pool in pools], ['unknown:2147483649', 'unknown:2147483650'])
+        self.assertTrue(all(pool['groups'] == 1 for pool in pools))
 
     def test_retry_claim_node_exclusion_and_pause(self):
         self.add_group(layout(2))
@@ -182,8 +279,9 @@ class TestMaster(unittest.TestCase):
         thread.start()
         try:
             url = 'http://127.0.0.1:%d/claim' % server.server_port
-            with self.assertRaises(svc.urllib.error.HTTPError):
+            with self.assertRaises(svc.urllib.error.HTTPError) as failure:
                 svc.http(url, data={'worker': 'one'})
+            self.assertTrue(failure.exception.fp.closed)
             result = svc.http(url, {'Authorization': 'Bearer secret'}, {'worker': 'one'})
             self.assertEqual(result['job']['layout']['id'], 1)
         finally:
@@ -261,7 +359,8 @@ class TestMaster(unittest.TestCase):
         timer.start()
         try:
             with patch.object(svc, 'ydb_http', side_effect=ydb), patch.object(self.master, 'rpc', side_effect=rpc), \
-                    patch.object(svc, 'run_blobsan', side_effect=lambda *_: set() if repaired else {BLOB}):
+                    patch.object(svc, 'run_blobsan', side_effect=lambda *_: (
+                        set() if repaired else {BLOB}, scan_report(blobs=0 if repaired else 1))):
                 svc.work(args(master='127.0.0.1:%d' % server.server_port), directory)
             self.assertEqual(len(reports), 2)
             self.assertEqual(reports[0]['findings'], {BLOB: 'request_ok'})
@@ -276,6 +375,30 @@ class TestMaster(unittest.TestCase):
             server_thread.join()
             server.server_close()
             svc.STOP.clear()
+
+    def test_scan_only_worker_publishes_report_without_repair_or_resolving_findings(self):
+        self.result(self.claim(), {BLOB: 'request_ok'})
+        self.master.console('scan 1')
+        directory = self.directory / 'worker'
+        directory.mkdir()
+        now = time.time()
+        coverage = dict(completed_vdisks=list(range(9)), missing_vdisks=[], stream_errors={},
+                        scan_report=scan_report(), started_at=now - 2, finished_at=now - 1)
+
+        def rpc(url, headers, data, **kwargs):
+            action = '/' + url.rsplit('/', 1)[1]
+            reply = self.master.rpc(action, data)
+            if action == '/result':
+                svc.STOP.set()
+            return reply
+
+        with patch.object(svc, 'http', side_effect=rpc), patch.object(svc, 'validate_layout'), \
+                patch.object(svc, 'scan', return_value=({BLOB}, coverage)), patch.object(svc, 'repair') as repair:
+            svc.work(args(scan_only=True), directory)
+        repair.assert_not_called()
+        self.assertEqual(json.loads(self.master.console('layouts 1'))['scan_report']['totals']['blobs'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        svc.STOP.clear()
 
 
 class TestWorker(unittest.TestCase):
@@ -321,12 +444,15 @@ class TestWorker(unittest.TestCase):
     def test_relative_blobsan_runs_checked_executable(self):
         binary = self.directory / 'blobsan'
         binary.write_text('#!/bin/sh\n'
-                          '[ "$#" -eq 2 ] && [ "$1" = --write2x2-candidates ] && [ "$2" = mirror-3-dc ] || exit 2\n'
+                          '[ "$#" -eq 6 ] && [ "$1" = --write2x2-candidates ] && [ "$2" = --scan-manifest ] '
+                          '&& [ "$4" = --scan-report ] && [ "$6" = mirror-3-dc ] || exit 2\n'
                           'IFS= read -r snapshot\n'
                           '[ "$snapshot" = "opaque snapshot bytes" ] || exit 3\n'
+                          "/bin/cat > \"$5\" <<'REPORT'\n" + json.dumps(scan_report()) + '\nREPORT\n'
                           "printf '%s\\n' 'GroupId# 1 BlobId# " + BLOB + "' >&2\n")
         binary.chmod(0o700)
         (self.directory / 'snapshot').write_bytes(b'opaque snapshot bytes\n')
+        svc.atomic_json(self.directory / 'manifest.json', dict(group_id=1, completed_vdisks=list(range(9))))
         decoy_dir = self.directory / 'bin'
         decoy_dir.mkdir()
         decoy = decoy_dir / 'blobsan'
@@ -335,7 +461,7 @@ class TestWorker(unittest.TestCase):
 
         def work(parsed, directory):
             self.assertEqual(parsed.blobsan, str(binary.resolve()))
-            self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), {BLOB})
+            self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), ({BLOB}, scan_report()))
 
         previous_cwd = Path.cwd()
         try:
@@ -349,7 +475,7 @@ class TestWorker(unittest.TestCase):
         finally:
             os.chdir(previous_cwd)
 
-    def test_scan_six_streams_and_reject_partial_second_realm(self):
+    def test_scan_accepts_partial_coverage_and_rejects_no_complete_streams(self):
         def run(failed):
             counts = {}
 
@@ -363,14 +489,20 @@ class TestWorker(unittest.TestCase):
                     return b'opaque snapshot bytes'
                 return b''
 
-            with patch.object(svc, 'ydb_http', side_effect=fetch), patch.object(svc, 'run_blobsan', return_value={BLOB}):
+            def analyze(_args, gid, directory, cancel):
+                manifest = json.loads((directory / 'manifest.json').read_text())
+                return {BLOB}, scan_report(manifest['completed_vdisks'])
+
+            with patch.object(svc, 'ydb_http', side_effect=fetch), patch.object(svc, 'run_blobsan', side_effect=analyze):
                 return svc.scan(args(), {'layout': layout()}, self.directory, threading.Event())
 
         found, coverage = run({7, 8, 9})
         self.assertEqual(found, {BLOB})
         self.assertEqual(coverage['missing_vdisks'], [6, 7, 8])
+        _, coverage = run({6, 7, 8, 9})
+        self.assertEqual(coverage['completed_vdisks'], list(range(5)))
         with self.assertRaises(RuntimeError):
-            run({6, 7, 8, 9})
+            run(set(range(1, 10)))
 
     def test_repair_json_semantics_and_expired_local_lease(self):
         responses = [{'TenantInfo': []}, {'SystemStateInfo': [{'NodeId': 10}]}, {'Status': 'OK', 'Blobs': []}]
@@ -380,6 +512,27 @@ class TestWorker(unittest.TestCase):
         cancel.deadline = time.monotonic() - 1
         with self.assertRaises(RuntimeError):
             svc.check_running(cancel)
+
+    def test_failed_stream_payload_is_discarded_and_empty_streams_are_in_manifest(self):
+        calls = {}
+
+        def fetch(_args, url, raw=False):
+            node = int(svc.urllib.parse.urlsplit(url).path.split('/')[2])
+            if node != 9:
+                return b''
+            calls[node] = calls.get(node, 0) + 1
+            if calls[node] == 1:
+                return b'partial payload'
+            raise OSError('stream interrupted')
+
+        completed = list(range(8))
+        with patch.object(svc, 'ydb_http', side_effect=fetch), \
+                patch.object(svc, 'run_blobsan', return_value=(set(), scan_report(completed, blobs=0))):
+            _, coverage = svc.scan(args(), {'layout': layout()}, self.directory, threading.Event())
+        self.assertEqual(coverage['completed_vdisks'], completed)
+        self.assertEqual(coverage['stream_errors'], {8: 'stream interrupted'})
+        self.assertEqual((self.directory / 'snapshot').read_bytes(), b'')
+        self.assertEqual(json.loads((self.directory / 'manifest.json').read_text())['completed_vdisks'], completed)
 
     def test_pending_result_replayed_after_restart(self):
         svc.atomic_json(self.directory / 'worker.json', {'id': 'worker'})
@@ -398,6 +551,37 @@ class TestWorker(unittest.TestCase):
         finally:
             svc.STOP.clear()
 
+    def test_missing_master_logs_one_line_and_keeps_retrying(self):
+        self.addCleanup(svc.STOP.clear)
+        # A bound socket without listen() reliably refuses connections while
+        # keeping the port reserved for the duration of this test.
+        with socket.socket() as unavailable:
+            unavailable.bind(('127.0.0.1', 0))
+            master = '127.0.0.1:%d' % unavailable.getsockname()[1]
+            with self.assertLogs(svc.LOG, level='INFO') as logs, \
+                    patch.object(svc.STOP, 'wait', side_effect=lambda _: svc.STOP.set()) as wait:
+                svc.work(args(master=master, request_timeout=1, poll=5), self.directory)
+        wait.assert_called_once_with(5)
+        self.assertEqual(len(logs.records), 1)
+        self.assertFalse(logs.records[0].exc_info)
+        self.assertEqual(len(logs.output[0].splitlines()), 1)
+        self.assertIn('Connection refused', logs.output[0])
+        self.assertIn('retrying in 5s', logs.output[0])
+
+    def test_failed_result_submission_preserves_pending_and_logs_one_line(self):
+        self.addCleanup(svc.STOP.clear)
+        pending = dict(group=1, token='lease', result={'error': 'test'})
+        svc.atomic_json(self.directory / 'pending.json', pending)
+        with self.assertLogs(svc.LOG, level='INFO') as logs, \
+                patch.object(svc, 'http', side_effect=svc.urllib.error.URLError('connection\nrefused')), \
+                patch.object(svc.STOP, 'wait', side_effect=lambda _: svc.STOP.set()):
+            svc.work(args(), self.directory)
+        self.assertEqual(json.loads((self.directory / 'pending.json').read_text()), pending)
+        self.assertEqual(len(logs.output), 1)
+        self.assertEqual(len(logs.output[0].splitlines()), 1)
+        self.assertIn('connection refused', logs.output[0])
+        self.assertFalse(logs.records[0].exc_info)
+
     def test_scratch_failure_reports_error_and_stops_heartbeat(self):
         (self.directory / 'scan').write_text('not a directory')
         replies = []
@@ -410,11 +594,53 @@ class TestWorker(unittest.TestCase):
             svc.STOP.set()
             return {'accepted': True}
 
-        with patch.object(svc, 'http', side_effect=reply):
+        with self.assertLogs(svc.LOG, level='ERROR') as logs, patch.object(svc, 'http', side_effect=reply):
             svc.work(args(), self.directory)
         self.assertEqual(len(replies), 1)
         self.assertIn('error', replies[0]['result'])
+        self.assertEqual(len(logs.output), 1)
+        self.assertFalse(logs.records[0].exc_info)
         svc.STOP.clear()
+
+
+class TestHttp(unittest.TestCase):
+    def test_responses_close_sockets_without_resource_warnings(self):
+        class Handler(svc.http_server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == '/error':
+                    self.send_error(503, 'Unavailable')
+                    return
+                body = b'' if self.path == '/empty' else b'{"ok":true}'
+                self.send_response(200)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            gc.collect()
+            with warnings.catch_warnings(record=True) as recorded:
+                warnings.simplefilter('always', ResourceWarning)
+                base = 'http://127.0.0.1:%d' % server.server_port
+                for _ in range(10):
+                    self.assertEqual(svc.http(base + '/ok'), {'ok': True})
+                    self.assertEqual(svc.http(base + '/empty', raw=True), b'')
+                    with self.assertRaises(svc.urllib.error.HTTPError) as failure:
+                        svc.http(base + '/error')
+                    self.assertEqual(failure.exception.code, 503)
+                    self.assertTrue(failure.exception.fp.closed)
+                    del failure
+                gc.collect()
+            self.assertEqual([str(w.message) for w in recorded if issubclass(w.category, ResourceWarning)], [])
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
 
 
 class TestCLI(unittest.TestCase):
@@ -459,3 +685,35 @@ class TestCLI(unittest.TestCase):
             commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
             parsed = parser.parse_args(['cluster', 'write2x2service'] + tail)
             self.assertEqual(parsed.write2x2_action, tail[0])
+
+    def test_scan_only_flag(self):
+        parser = ArgumentParser()
+        commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
+        parsed = parser.parse_args(['cluster', 'write2x2service', 'worker', '--master', 'host:22570',
+                                    '--db', '/tmp/worker', '--scan-only'])
+        self.assertTrue(parsed.scan_only)
+
+
+class TestScanReportValidation(unittest.TestCase):
+    def test_empty_and_partial_reports(self):
+        for completed in (list(range(9)), [0, 1, 2], [7]):
+            for blobs in (0, 2):
+                report = scan_report(completed, blobs=blobs)
+                self.assertEqual(write2x2_report.validate(report, 1, completed), report)
+
+    def test_malformed_reports(self):
+        mutations = [lambda r: r.update(version=2), lambda r: r.update(group_id=2),
+                     lambda r: r.update(completed_vdisks=[0]), lambda r: r.update(totals={}),
+                     lambda r: r['buckets'].append(r['buckets'][0]),
+                     lambda r: r['buckets'][0].update(local='1+1+?'),
+                     lambda r: r['buckets'][0].update(ingress='1+1+?'),
+                     lambda r: r['buckets'][0].update(gc='unknown'),
+                     lambda r: r['buckets'][0].update(blobs=-1),
+                     lambda r: r['buckets'][0].update(blobs=True),
+                     lambda r: r['buckets'][0].update(missing_metadata_blobs=2)]
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                report = scan_report()
+                mutate(report)
+                with self.assertRaises(ValueError):
+                    write2x2_report.validate(report, 1, list(range(9)))
