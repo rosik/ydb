@@ -472,7 +472,9 @@ class TestWorker(unittest.TestCase):
 
         def work(parsed, directory):
             self.assertEqual(parsed.blobsan, str(binary.resolve()))
-            self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), ({BLOB}, scan_report()))
+            for scan_only in (False, True):
+                parsed.scan_only = scan_only
+                self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), ({BLOB}, scan_report()))
 
         previous_cwd = Path.cwd()
         try:
@@ -717,6 +719,21 @@ class TestCLI(unittest.TestCase):
 
 
 class TestScanReportValidation(unittest.TestCase):
+    def test_annotated_buckets_remain_distinct_from_legacy_and_other_annotations(self):
+        report = scan_report(blobs=2)
+        legacy = report['buckets'][0]
+        candidate = dict(legacy, phantom_like=False, write2x2_candidate=True)
+        phantom = dict(legacy, phantom_like=True, write2x2_candidate=False, missing_metadata_blobs=2)
+        report['buckets'] = [legacy, candidate, phantom]
+        report['totals'] = write2x2_report.totals(report['buckets'])
+        write2x2_report.validate(report, 1, list(range(9)))
+        histogram = {}
+        write2x2_report.merge(histogram, report['buckets'])
+        rows = write2x2_report.histogram_rows(histogram)
+        self.assertEqual(len(rows), 3)
+        self.assertIsNone(rows[0]['write2x2_candidate'])
+        self.assertEqual(write2x2_report.totals(rows), report['totals'])
+
     def test_empty_and_partial_reports(self):
         for completed in (list(range(9)), [0, 1, 2], [7]):
             for blobs in (0, 2):
@@ -732,6 +749,11 @@ class TestScanReportValidation(unittest.TestCase):
                      lambda r: r['buckets'][0].update(gc='unknown'),
                      lambda r: r['buckets'][0].update(blobs=-1),
                      lambda r: r['buckets'][0].update(blobs=True),
+                     lambda r: r['buckets'][0].update(phantom_like=1),
+                     lambda r: r['buckets'][0].update(write2x2_candidate='yes'),
+                     lambda r: r['buckets'][0].update(phantom_like=True),
+                     lambda r: r['buckets'][0].update(phantom_like=True, write2x2_candidate=True, missing_metadata_blobs=1),
+                     lambda r: r['buckets'][0].update(phantom_like=False, write2x2_candidate=True, gc='hard_barrier'),
                      lambda r: r['buckets'][0].update(missing_metadata_blobs=2)]
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index):

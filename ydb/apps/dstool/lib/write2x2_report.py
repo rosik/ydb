@@ -5,10 +5,11 @@ import re
 
 GC_STATES = {'hard_barrier', 'do_not_keep', 'soft_without_keep', 'soft_with_keep', 'no_covering_barrier'}
 METRICS = ('blobs', 'logical_bytes', 'observed_replica_bytes', 'missing_metadata_blobs')
+ANNOTATIONS = ('phantom_like', 'write2x2_candidate')
 
 
 def bucket_key(bucket):
-    return tuple(bucket[key] for key in ('local', 'ingress', 'gc'))
+    return tuple(bucket[key] for key in ('local', 'ingress', 'gc')) + tuple(bucket.get(key) for key in ANNOTATIONS)
 
 
 def totals(buckets):
@@ -42,6 +43,14 @@ def validate(report, gid, completed):
             raise ValueError('Invalid scan counters')
         if not bucket['blobs'] or bucket['missing_metadata_blobs'] > bucket['blobs']:
             raise ValueError('Invalid blob counts')
+        if any(bucket.get(key) is not None and type(bucket[key]) is not bool for key in ANNOTATIONS):
+            raise ValueError('Invalid scan annotation')
+        if bucket.get('phantom_like') is not None and bucket['missing_metadata_blobs'] != (
+                bucket['blobs'] if bucket['phantom_like'] else 0):
+            raise ValueError('Phantom annotation contradicts missing metadata')
+        if bucket.get('write2x2_candidate') and (bucket.get('phantom_like') is not False or
+                bucket['gc'] not in ('soft_with_keep', 'no_covering_barrier')):
+            raise ValueError('Invalid write2x2 candidate annotation')
         key = bucket_key(bucket)
         if key in seen:
             raise ValueError('Duplicate scan bucket')
@@ -54,10 +63,12 @@ def validate(report, gid, completed):
 def merge(histogram, buckets):
     for bucket in buckets:
         key = bucket_key(bucket)
-        target = histogram.setdefault(key, dict(zip(('local', 'ingress', 'gc'), key), **dict.fromkeys(METRICS, 0)))
+        target = histogram.setdefault(key, dict(zip(('local', 'ingress', 'gc') + ANNOTATIONS, key),
+                                                **dict.fromkeys(METRICS, 0)))
         for metric in METRICS:
             target[metric] += bucket[metric]
 
 
 def histogram_rows(histogram):
-    return [histogram[key] for key in sorted(histogram)]
+    return [histogram[key] for key in sorted(histogram, key=lambda k: k[:3] + tuple(
+        -1 if value is None else int(value) for value in k[3:]))]

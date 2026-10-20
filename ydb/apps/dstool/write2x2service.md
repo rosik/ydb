@@ -80,7 +80,19 @@ It displays pools, groups, layout histograms, workers and unresolved findings.
 Select a pool or group with **Enter** to open its histogram; Enter on a finding
 opens its group. Local layout `?` means incomplete coverage of that realm;
 `0` means all three VDisks were scanned and no local part was observed.
-Ingress columns show metadata claims. Byte totals are displayed in KiB (1024 bytes).
+The main histogram groups by Local and shows blob counts, logical size,
+`phantom_like` and `write2x2-candidate`. Enter on a Local row opens its ingress/GC
+breakdown, replica size and missing metadata. Sizes choose B/KiB/MiB/GiB automatically.
+Ingress columns show metadata claims.
+
+The default GC filter includes `soft_with_keep` and `no_covering_barrier`.
+Choose either separately, any other GC state, or all states in the selector.
+`hard_barrier`, `do_not_keep` and `soft_without_keep` have a collapsed GC summary.
+Annotation columns display `yes`, `no`, or `mixed (N/total)` when only N blobs
+in the Local row have the flag. `unknown` means the report lacks the annotation;
+old reports remain readable. The flags come from blobsan, including for observation-only
+workers; the client does not infer them from Local or ingress. Each refresh replaces
+the displayed histogram. Each group contributes only its latest successful scan.
 
 The active view and service stats refresh every 5 seconds (`client --refresh SEC`).
 **F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses the
@@ -174,8 +186,8 @@ three complete VDisk streams in each of at least two realms.
 
 The assembled snapshot is passed as stdin to
 `blobsan --write2x2-candidates --scan-manifest manifest.json --scan-report report.json mirror-3-dc`.
-`--scan-only` is also passed when repairs are disabled or candidate coverage is
-insufficient. Stdout goes
+Blobsan emits its usual candidate diagnostics; the worker decides whether to
+act on them. Stdout goes
 to `/dev/null`, as in the original scripts (this also disables verbose output
 in blobsan). Stderr is saved and only `GroupId# ... BlobId# ...` lines are parsed.
 The supplied executable is the sole authority on candidate selection and
@@ -216,6 +228,17 @@ and GC/existence decisions remain in DSProxy through `mustRestoreFirst`.
 | `logical_bytes` | Sum of BlobSize once per blob |
 | `observed_replica_bytes` | Sum of BlobSize for every observed correctly placed local part |
 | `missing_metadata_blobs` | Blobs with no index record on at least one successfully captured VDisk |
+
+New analyzers also supply boolean `phantom_like` and `write2x2_candidate` per
+bucket. Buckets with different annotations remain separate in the report and
+pool aggregation, even when Local, ingress and GC match. `phantom_like` is the
+analyzer's `seenDisks != blob.Info.Nodes` condition: at least one captured index
+has no metadata record for this BlobId. `write2x2_candidate` uses the same GC,
+local completeness, metadata, restorability and failure-model conditions as the
+`--write2x2-candidates` output. It is included in the report regardless of whether
+the worker issues repair requests. Without `--write2x2-candidates`
+this field is null, since that mode accepts different GC barriers. Missing/null
+annotations in older reports mean unknown, rather than false.
 
 Both layout strings use **group failrealm order** (0, 1, 2), rather than the
 blob-dependent part/subgroup order. `local=1+1+?` means one copy in each of the

@@ -371,15 +371,13 @@ class TestBlobSan:
 
 
 class TestScanReport(unittest.TestCase):
-    def analyze(self, data, completed=None, scan_only=True, check=True):
+    def analyze(self, data, completed=None, check=True):
         completed = data.parameters['indexes'] if completed is None else completed
         binary = yatest.common.binary_path('ydb/tools/blobsan/blobsan')
         with tempfile.TemporaryDirectory() as directory:
             manifest, report = Path(directory) / 'manifest.json', Path(directory) / 'report.json'
             manifest.write_text(json.dumps(dict(group_id=1, completed_vdisks=list(completed))))
             command = [binary, '--write2x2-candidates', '--scan-manifest', str(manifest), '--scan-report', str(report)]
-            if scan_only:
-                command.append('--scan-only')
             command.append('mirror-3-dc')
             result = subprocess.run(command, input=bytes(data), stdout=subprocess.DEVNULL,
                                     stderr=subprocess.PIPE, check=check)
@@ -392,11 +390,12 @@ class TestScanReport(unittest.TestCase):
         for parts, local, replica_bytes in cases:
             with self.subTest(local=local):
                 report, result = self.analyze(snapshot(indexes=range(9), local_realms=(), local_parts=parts,
-                                                       known_nodes=(0, 1, 2)), scan_only=False)
+                                                       known_nodes=(0, 1, 2)))
                 self.assertNotIn(b'GroupId#', result.stderr)
                 expected = dict(
                     local=local, ingress='1+1+1', gc='no_covering_barrier', blobs=1,
-                    logical_bytes=100, observed_replica_bytes=replica_bytes, missing_metadata_blobs=0)
+                    logical_bytes=100, observed_replica_bytes=replica_bytes, missing_metadata_blobs=0,
+                    phantom_like=False, write2x2_candidate=False)
                 self.assertEqual(report['buckets'], [expected])
                 self.assertEqual(report['totals']['blobs'], 1)
 
@@ -411,7 +410,7 @@ class TestScanReport(unittest.TestCase):
                 self.assertEqual(report['completed_vdisks'], sorted(completed))
 
     def test_manifest_includes_empty_streams_and_missing_metadata_is_not_filtered(self):
-        report, result = self.analyze(snapshot(indexes=(6, 7, 8)), completed=range(9), scan_only=False)
+        report, result = self.analyze(snapshot(indexes=(6, 7, 8)), completed=range(9))
         self.assertEqual(report['buckets'][0]['local'], '0+0+3')
         self.assertEqual(report['totals']['missing_metadata_blobs'], 1)
         self.assertNotIn(b'GroupId#', result.stderr)
@@ -452,6 +451,46 @@ class TestScanReport(unittest.TestCase):
         report, _ = self.analyze(snapshot(indexes=range(9), local_realms=(), local_parts={7: (1,)}))
         self.assertEqual(report['buckets'][0]['local'], '0+0+0')
         self.assertEqual(report['totals']['observed_replica_bytes'], 0)
+
+    def test_annotations_match_candidate_selection(self):
+        cases = [
+            dict(indexes=range(9)),
+            dict(indexes=range(9), keep=1, barrier='soft'),
+            dict(indexes=range(9), keep=1, barrier='hard'),
+            dict(indexes=range(9), keep=2),
+            dict(indexes=range(9), barrier='soft'),
+            dict(indexes=range(9), local_realms=(0, 1, 2)),
+            dict(indexes=range(9), local_realms=()),
+            dict(indexes=range(9), local_realms=(), local_parts={7: (1,)}),
+            dict(indexes=range(9), blob_indexes=(0, 1, 2, 6, 7, 8)),
+            dict(indexes=TWO_REALMS),
+            dict(indexes=(7,)),
+            dict(indexes=range(9), known_full=False),
+        ]
+        for parameters in cases:
+            with self.subTest(parameters=parameters):
+                data = snapshot(**parameters)
+                report, result = self.analyze(data)
+                bucket, = report['buckets']
+                self.assertEqual(bucket['write2x2_candidate'], b'GroupId#' in result.stderr)
+                self.assertEqual(bucket['phantom_like'], bool(bucket['missing_metadata_blobs']))
+
+    def test_same_layout_splits_phantom_and_candidate_annotations(self):
+        data = snapshot(indexes=range(9), local_realms=(), local_parts={7: (0,), 1: (1,)},
+                        known_nodes=(0, 1, 2))
+        other = snapshot(indexes=range(9), local_realms=(), local_parts={0: (0,), 6: (2,)},
+                         known_nodes=(0, 1, 2), blob_indexes=range(8), blob_channel=5,
+                         subgroup_order=CHANNEL5_SUBGROUP_ORDER)
+        other_blobs = {index: blobs for index, _, blobs, _ in other.records}
+        data.records = [(index, node, blobs + other_blobs[index], barriers)
+                        for index, node, blobs, barriers in data.records]
+        report, result = self.analyze(data)
+        self.assertEqual(len(report['buckets']), 2)
+        self.assertEqual({(b['local'], b['ingress'], b['gc']) for b in report['buckets']},
+                         {('1+0+1', '1+1+1', 'no_covering_barrier')})
+        self.assertEqual({(b['phantom_like'], b['write2x2_candidate']) for b in report['buckets']},
+                         {(False, True), (True, False)})
+        self.assertEqual(result.stderr.count(b'GroupId#'), 1)
 
     def test_manifest_rejects_duplicate_and_unlisted_vdisks(self):
         for completed in [(7, 7), (9,), (-1,), (0, 1, 2)]:
@@ -498,7 +537,7 @@ class TestScanReport(unittest.TestCase):
                 scratch.mkdir()
                 with patch.object(svc, 'ydb_http', side_effect=fetch):
                     candidates, coverage = svc.scan(args, job, scratch, threading.Event())
-                self.assertEqual(candidates, set())
+                self.assertEqual(candidates, {'[1:1:1:0:0:100:0]'})
                 reply = master.rpc('/result', dict(
                     worker='test', group=1, token=job['token'], result=dict(findings={}, findings_complete=False, **coverage)))
                 self.assertTrue(reply['accepted'])

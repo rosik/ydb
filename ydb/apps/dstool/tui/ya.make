@@ -8,6 +8,7 @@ PY_SRCS(
 PEERDIR(
     contrib/python/rich
     contrib/python/textual
+    ydb/apps/dstool/lib
 )
 
 END()

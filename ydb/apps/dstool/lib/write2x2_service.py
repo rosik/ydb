@@ -606,8 +606,6 @@ def run_blobsan(args, gid, directory, cancel):
     statistics_path.unlink(missing_ok=True)
     command = [args.blobsan, '--write2x2-candidates', '--scan-manifest', str(manifest_path),
                '--scan-report', str(statistics_path)]
-    if args.scan_only or not has_two_complete_realms(manifest['completed_vdisks']):
-        command.append('--scan-only')
     command.append('mirror-3-dc')
     with (directory / 'snapshot').open('rb') as inp, report.open('wb') as err:
         process = subprocess.Popen(command,

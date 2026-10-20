@@ -34,7 +34,6 @@ ui32 BlobSubgroupSize = 0;
 
 bool OutputCout = true;
 bool Write2x2Candidates = false;
-bool ScanOnly = false;
 TString ScanManifestPath;
 TString ScanReportPath;
 
@@ -434,8 +433,6 @@ int main(int argc, char **argv) {
         .RequiredArgument("PATH").StoreResult(&ScanManifestPath);
     opts.AddLongOption("scan-report", "Write a JSON histogram of all observed mirror-3-dc blobs before candidate filtering")
         .RequiredArgument("PATH").StoreResult(&ScanReportPath);
-    opts.AddLongOption("scan-only", "Produce the scan report without emitting recovery candidates")
-        .StoreTrue(&ScanOnly);
     opts.AddSection("Input",
         "Read a binary snapshot from stdin, as produced by `ydb-dstool group take-snapshot`."
         " It contains group/VDisk headers and bzip2-compressed LogoBlobs, Blocks and"
@@ -487,9 +484,8 @@ int main(int argc, char **argv) {
         return 1;
     }
     const bool scanReport = !ScanReportPath.empty();
-    if (scanReport != !ScanManifestPath.empty() || (ScanOnly && !scanReport)
-            || (scanReport && species != TBlobStorageGroupType::ErasureMirror3dc)) {
-        Cerr << "--scan-report and --scan-manifest must be used together with mirror-3-dc; --scan-only requires both" << Endl;
+    if (scanReport != !ScanManifestPath.empty() || (scanReport && species != TBlobStorageGroupType::ErasureMirror3dc)) {
+        Cerr << "--scan-report and --scan-manifest must be used together with mirror-3-dc" << Endl;
         return 1;
     }
     ui32 scanGroupId = 0;
@@ -548,7 +544,7 @@ int main(int argc, char **argv) {
     }
 
     TBufferedOutput err(&Cerr, 1_MB);
-    std::map<std::tuple<TString, TString, TString>, TScanCounters> scanBuckets;
+    std::map<std::tuple<TString, TString, TString, bool, bool>, TScanCounters> scanBuckets;
     TScanCounters scanTotals;
 
     for (auto& [groupId, group] : Groups) {
@@ -635,33 +631,6 @@ int main(int argc, char **argv) {
             TBlobStorageGroupInfo::TOrderNums nums;
             info.GetTopology().PickSubgroup(blobId.Hash(), nums);
 
-            if (scanReport) {
-                const TString gc = blob.Hard ? "hard_barrier"
-                    : blob.Info.KeepMode == DO_NOT_KEEP ? "do_not_keep"
-                    : blob.UnderBarrierMask ? (blob.Info.KeepMode == KEEP ? "soft_with_keep" : "soft_without_keep")
-                    : "no_covering_barrier";
-                ui32 replicas = 0;
-                const TString local = ScanLayout(blob.ObservedLocalLayout, nums, info, &completed, &replicas);
-                const TString ingress = ScanLayout(blob.Info.Layout, nums, info, nullptr);
-                ui32 seenDisks = 0;
-                for (ui32 node = 0; node < nums.size(); ++node) {
-                    if (completed.contains(nums[node])) {
-                        seenDisks |= 1 << node;
-                    }
-                }
-                auto add = [&](TScanCounters& counters) {
-                    ++counters.Blobs;
-                    counters.LogicalBytes += blobId.BlobSize();
-                    counters.ObservedReplicaBytes += ui64(replicas) * blobId.BlobSize();
-                    counters.MissingMetadataBlobs += seenDisks != blob.Info.Nodes;
-                };
-                add(scanBuckets[{local, ingress, gc}]);
-                add(scanTotals);
-            }
-            if (ScanOnly) {
-                continue;
-            }
-
             auto originalLocalLayout = blob.Info.LocalLayout;
 
             for (ui32 i = 0; i < BlobSubgroupSize; ++i) {
@@ -708,35 +677,54 @@ int main(int argc, char **argv) {
                 }
             }
 
-            if (blob.Hard || blob.Info.KeepMode == DO_NOT_KEEP) {
-                continue;
-            }
-            if (blob.UnderBarrierMask && blob.Info.KeepMode != KEEP) {
-                continue;
-            }
-            if (!Write2x2Candidates && (!blob.UnderBarrierMask || blob.Info.KeepMode != KEEP)) {
-                continue;
-            }
-
-            if (Write2x2Candidates ? isFull(originalLocalLayout) :
-                    (isFull(blob.Info.Layout) && isFull(blob.Info.ReflectionLayout) && isFull(blob.Info.LocalLayout))) {
-                // looks like correct blob -- either it is not under barrier (and may be being written right now), or
-                // it is with keep flags and fully written with correct ingress bits on every disk
-                continue;
-            }
-
             ui32 seenDisks = 0;
             for (ui32 i = 0; i < BlobSubgroupSize; ++i) {
                 if (group.States.contains(nums[i])) {
                     seenDisks |= 1 << i;
                 }
             }
-
             const bool phantomLike = seenDisks != blob.Info.Nodes;
+            const bool gcEligible = !blob.Hard && blob.Info.KeepMode != DO_NOT_KEEP
+                && (!blob.UnderBarrierMask || blob.Info.KeepMode == KEEP);
+            const bool restorable = !phantomLike && numParts >= type.MinimalRestorablePartCount()
+                && numLocalParts >= type.MinimalRestorablePartCount()
+                && checker.CheckFailModelForSubgroup(~TBlobStorageGroupInfo::TSubgroupVDisks::CreateFromMask(
+                    &info.GetTopology(), blob.Info.Nodes));
+            const bool fullLocalLayout = isFull(originalLocalLayout);
+            const bool write2x2Candidate = gcEligible && !fullLocalLayout && restorable;
 
-            if (phantomLike || numParts < type.MinimalRestorablePartCount() || numLocalParts < type.MinimalRestorablePartCount() ||
-                    !info.GetQuorumChecker().CheckFailModelForSubgroup(~TBlobStorageGroupInfo::TSubgroupVDisks::CreateFromMask(
-                    &info.GetTopology(), blob.Info.Nodes))) {
+            if (scanReport) {
+                const TString gc = blob.Hard ? "hard_barrier"
+                    : blob.Info.KeepMode == DO_NOT_KEEP ? "do_not_keep"
+                    : blob.UnderBarrierMask ? (blob.Info.KeepMode == KEEP ? "soft_with_keep" : "soft_without_keep")
+                    : "no_covering_barrier";
+                ui32 replicas = 0;
+                const TString local = ScanLayout(blob.ObservedLocalLayout, nums, info, &completed, &replicas);
+                const TString ingress = ScanLayout(blob.Info.Layout, nums, info, nullptr);
+                auto add = [&](TScanCounters& counters) {
+                    ++counters.Blobs;
+                    counters.LogicalBytes += blobId.BlobSize();
+                    counters.ObservedReplicaBytes += ui64(replicas) * blobId.BlobSize();
+                    counters.MissingMetadataBlobs += phantomLike;
+                };
+                add(scanBuckets[{local, ingress, gc, phantomLike, write2x2Candidate}]);
+                add(scanTotals);
+            }
+            if (!gcEligible) {
+                continue;
+            }
+            if (!Write2x2Candidates && (!blob.UnderBarrierMask || blob.Info.KeepMode != KEEP)) {
+                continue;
+            }
+
+            if (Write2x2Candidates ? fullLocalLayout :
+                    (isFull(blob.Info.Layout) && isFull(blob.Info.ReflectionLayout) && isFull(blob.Info.LocalLayout))) {
+                // looks like correct blob -- either it is not under barrier (and may be being written right now), or
+                // it is with keep flags and fully written with correct ingress bits on every disk
+                continue;
+            }
+
+            if (!restorable) {
                 // looks like phantom blob -- count found parts as trash
                 for (ui32 partIdx = 0; partIdx < TotalPartCount; ++partIdx) {
                     if (const ui32 disks = blob.Info.LocalLayout.GetDisksWithPart(partIdx)) {
@@ -806,10 +794,13 @@ int main(int argc, char **argv) {
         report["buckets"] = NJson::TJsonValue(NJson::JSON_ARRAY);
         for (const auto& [key, counters] : scanBuckets) {
             auto bucket = counters.ToJson();
-            const auto& [local, ingress, gc] = key;
+            const auto& [local, ingress, gc, phantomLike, write2x2Candidate] = key;
             bucket["local"] = local;
             bucket["ingress"] = ingress;
             bucket["gc"] = gc;
+            bucket["phantom_like"] = phantomLike;
+            bucket["write2x2_candidate"] = Write2x2Candidates
+                ? NJson::TJsonValue(write2x2Candidate) : NJson::TJsonValue(NJson::JSON_NULL);
             report["buckets"].AppendValue(std::move(bucket));
         }
         TFileOutput output(ScanReportPath);

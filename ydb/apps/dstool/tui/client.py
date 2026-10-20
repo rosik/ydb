@@ -8,9 +8,14 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Button, DataTable, Footer, Header, Input, RichLog, Static, TabbedContent, TabPane
+from textual.widgets import Button, Collapsible, DataTable, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tabs
 
+from ydb.apps.dstool.lib import write2x2_report
 from ydb.apps.dstool.tui.connection import ConsoleConnection, ConsoleError, CommandError
+
+
+ACTIVE_GC = {'soft_with_keep', 'no_covering_barrier'}
+DISCARDED_GC = write2x2_report.GC_STATES - ACTIVE_GC
 
 
 def age(seconds):
@@ -30,8 +35,20 @@ def since(timestamp):
     return '-' if timestamp is None else age(time.time() - float(timestamp))
 
 
-def kib(value):
-    return f'{value / 1024:,.1f}'
+def size(value):
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
+        if value < 1024 or unit == 'PiB':
+            return f'{value:,.0f} B' if unit == 'B' else f'{value:,.1f} {unit}'
+        value /= 1024
+
+
+def annotation(buckets, key):
+    total = sum(b['blobs'] for b in buckets)
+    yes = sum(b['blobs'] for b in buckets if b.get(key) is True)
+    unknown = sum(b['blobs'] for b in buckets if b.get(key) is None)
+    if unknown:
+        return 'unknown' if unknown == total else f'{yes:,} yes; {unknown:,} unknown'
+    return 'yes' if yes == total else 'no' if not yes else f'mixed ({yes:,}/{total:,})'
 
 
 def json_rows(response):
@@ -59,13 +76,20 @@ class ConsoleApp(App):
     DataTable, RichLog { height: 1fr; }
     .hint { height: auto; color: $text-muted; }
     #detail { height: auto; max-height: 7; overflow-y: auto; }
+    #layout-filter { width: 55; }
+    #gc-table { height: 5; }
+    #bucket-table { height: 10; }
+    #gc-summary, #bucket-details { height: auto; padding: 0; }
     #command { dock: bottom; }
     """
     COLUMNS = {
         'pool-table': ('Pool', 'Key', 'Reports', 'Full', 'Partial', 'Never', 'Outdated', 'Stale',
-                       'Failed', 'Blobs', 'Logical KiB', 'Oldest'),
+                       'Failed', 'Blobs', 'Size', 'Oldest'),
         'group-table': ('Group', 'Pool', 'Generation', 'Scan age', 'Candidates', 'Worker', 'Due', 'Error'),
-        'layout-table': ('Local', 'Ingress', 'GC', 'Blobs', 'Logical KiB', 'Replica KiB', 'Missing metadata'),
+        'layout-table': ('Local', 'Blobs', 'Size', 'phantom_like', 'write2x2-candidate'),
+        'gc-table': ('GC', 'Blobs', 'Size'),
+        'bucket-table': ('Ingress', 'GC', 'Blobs', 'Size', 'Replica size', 'Missing metadata',
+                         'phantom_like', 'write2x2-candidate'),
         'worker-table': ('Worker', 'Last seen', 'Info'),
         'finding-table': ('Group', 'Blob', 'Status', 'First seen', 'Last seen', 'Coverage'),
     }
@@ -79,6 +103,8 @@ class ConsoleApp(App):
         self.stats = {}
         self._refreshing = self._refresh_again = self._command_busy = self._client_closing = False
         self._connected = False
+        self._layout_data = None
+        self._selected_layout = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -91,15 +117,23 @@ class ConsoleApp(App):
             yield Button('Inventory', id='inventory', disabled=True)
         with TabbedContent(initial='pools', id='views'):
             with TabPane('Pools', id='pools'):
-                yield Static('Enter on a pool opens its histogram. Sizes are logical bytes / 1024.', classes='hint')
+                yield Static('Enter on a pool opens its histogram.', classes='hint')
                 yield DataTable(id='pool-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Groups', id='groups'):
                 yield Static('Enter on a group opens its last successful scan.', classes='hint')
                 yield DataTable(id='group-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Layouts', id='layouts'):
                 yield Static('Select a pool or group with Enter on the corresponding tab.', id='detail', markup=False)
-                yield Static('Local: ? = incomplete realm; 0 = all three VDisks scanned, no part. Ingress = claims.', classes='hint')
+                yield Select([('soft_with_keep + no_covering_barrier', 'active'), ('all GC states', 'all')]
+                             + [(gc, gc) for gc in sorted(write2x2_report.GC_STATES)],
+                             value='active', allow_blank=False, id='layout-filter')
+                yield Static('Local: ? = incomplete realm; 0 = all three VDisks scanned, no part. '
+                             'Enter: ingress / GC details. mixed = yes / blobs; unknown = annotation unavailable.', classes='hint')
                 yield DataTable(id='layout-table', cursor_type='row', zebra_stripes=True)
+                with Collapsible(title='GC', collapsed=True, id='gc-summary'):
+                    yield DataTable(id='gc-table', cursor_type='row', zebra_stripes=True)
+                with Collapsible(title='Select a Local row with Enter for details', collapsed=True, id='bucket-details'):
+                    yield DataTable(id='bucket-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Workers', id='workers'):
                 yield DataTable(id='worker-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Findings', id='findings'):
@@ -133,6 +167,7 @@ class ConsoleApp(App):
     def _move_tab(self, step):
         tabs = self.query_one('#views', TabbedContent)
         order = ('pools', 'groups', 'layouts', 'workers', 'findings', 'console')
+        self.set_focus(tabs.query_one(Tabs))
         tabs.active = order[(order.index(tabs.active) + step) % len(order)]
 
 
@@ -212,7 +247,7 @@ class ConsoleApp(App):
             self._table('pool-table', [(p['pool_key'], (
                 p.get('pool'), p['pool_key'], f"{p['reported_groups']}/{p['groups']}", p['full_groups'],
                 p['partial_groups'], p['never_scanned_groups'], p['outdated_groups'], p['stale_inventory_groups'],
-                p['failed_groups'], p['totals']['blobs'], kib(p['totals']['logical_bytes']),
+                p['failed_groups'], p['totals']['blobs'], size(p['totals']['logical_bytes']),
                 age(p['oldest_scan_age_seconds']))) for p in json.loads(response)])
         elif view == 'groups':
             now = time.time()
@@ -230,17 +265,23 @@ class ConsoleApp(App):
             self._render_layout(json.loads(response), target)
 
     def _render_layout(self, data, target):
+        self._layout_data = (data, target)
         if target[0] == 'pool':
             if not data:
                 self.query_one('#detail', Static).update(f'Pool {target[1]} is no longer in inventory')
                 self._table('layout-table', [])
+                self._table('gc-table', [])
+                self._table('bucket-table', [])
                 return
             p, = data
             buckets, totals = p['buckets'], p['totals']
             text = (f"Pool {p.get('pool')} ({p['pool_key']}) · reports {p['reported_groups']}/{p['groups']} · "
-                    f"full {p['full_groups']} · partial {p['partial_groups']} · oldest {age(p['oldest_scan_age_seconds'])}\n"
-                    f"Excluded: never scanned {p['never_scanned_groups']}, outdated {p['outdated_groups']}, "
-                    f"stale inventory {p['stale_inventory_groups']} · latest failures {p['failed_groups']}")
+                    f"coverage full {p['full_groups']} · partial {p['partial_groups']} · oldest {age(p['oldest_scan_age_seconds'])}")
+            issues = [f'{label} {p[key]}' for key, label in (
+                ('never_scanned_groups', 'never scanned'), ('outdated_groups', 'outdated'),
+                ('stale_inventory_groups', 'stale inventory'), ('failed_groups', 'latest failures')) if p[key]]
+            if issues:
+                text += '\n' + ' · '.join(issues)
         else:
             report = data.get('scan_report')
             buckets, totals = (report['buckets'], report['totals']) if report else ([], {})
@@ -256,18 +297,59 @@ class ConsoleApp(App):
                 text += '\nLatest attempt error: ' + data['latest_error']
             if data.get('stream_errors'):
                 text += '\nStream errors: ' + json.dumps(data['stream_errors'], ensure_ascii=False)
+        selected_gc = self.query_one('#layout-filter', Select).value
+        visible = [b for b in buckets if selected_gc == 'all' or
+                   (b['gc'] in ACTIVE_GC if selected_gc == 'active' else b['gc'] == selected_gc)]
+        visible_totals = write2x2_report.totals(visible)
         if totals:
-            text += (f"\nBlobs: {totals['blobs']} · logical KiB: {kib(totals['logical_bytes'])} · "
-                     f"replica KiB: {kib(totals['observed_replica_bytes'])} · "
-                     f"missing metadata: {totals['missing_metadata_blobs']}")
+            text += (f"\nSelected: {visible_totals['blobs']:,} blobs · {size(visible_totals['logical_bytes'])}"
+                     f" · All GC states: {totals['blobs']:,} blobs · {size(totals['logical_bytes'])}")
         self.query_one('#detail', Static).update(text)
-        self._table('layout-table', [(json.dumps([b['local'], b['ingress'], b['gc']]), (
-            b['local'], b['ingress'], b['gc'], b['blobs'], kib(b['logical_bytes']),
-            kib(b['observed_replica_bytes']), b['missing_metadata_blobs'])) for b in buckets])
+        by_local = {}
+        for bucket in visible:
+            by_local.setdefault(bucket['local'], []).append(bucket)
+        rows = []
+        for local, items in by_local.items():
+            counts = write2x2_report.totals(items)
+            rows.append((local, (local, counts['blobs'], size(counts['logical_bytes']),
+                                *(annotation(items, key) for key in write2x2_report.ANNOTATIONS))))
+        rows.sort(key=lambda row: (-row[1][1], row[0]))
+        self._table('layout-table', rows)
+        gc_rows = []
+        for gc in sorted(DISCARDED_GC):
+            counts = write2x2_report.totals([b for b in buckets if b['gc'] == gc])
+            if counts['blobs']:
+                gc_rows.append((gc, (gc, counts['blobs'], size(counts['logical_bytes']))))
+        self._table('gc-table', gc_rows)
+        discarded = write2x2_report.totals([b for b in buckets if b['gc'] in DISCARDED_GC])
+        summary = self.query_one('#gc-summary', Collapsible)
+        summary.title = f"GC · {discarded['blobs']:,} blobs · {size(discarded['logical_bytes'])}"
+        summary.display = bool(discarded['blobs'])
+        self._render_bucket_details(visible)
+
+    def _render_bucket_details(self, visible):
+        items = [b for b in visible if b['local'] == self._selected_layout]
+        self.query_one('#bucket-details', Collapsible).title = (
+            'Local ' + self._selected_layout + ' · ingress / GC details' if items
+            else 'Select a Local row with Enter for details')
+        self._table('bucket-table', [(str(i), (
+            b['ingress'], b['gc'], b['blobs'], size(b['logical_bytes']), size(b['observed_replica_bytes']),
+            b['missing_metadata_blobs'], *(annotation([b], key) for key in write2x2_report.ANNOTATIONS)))
+            for i, b in enumerate(sorted(items, key=lambda b: (-b['blobs'], b['ingress'], b['gc'])))])
+
+    def on_select_changed(self, event: Select.Changed):
+        if event.select.id == 'layout-filter' and self._layout_data:
+            self._render_layout(*self._layout_data)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         key = event.row_key.value
-        if event.data_table.id == 'pool-table':
+        if event.data_table.id == 'layout-table':
+            self._selected_layout = key
+            if self._layout_data:
+                self._render_layout(*self._layout_data)
+            self.query_one('#bucket-details', Collapsible).collapsed = False
+            return
+        elif event.data_table.id == 'pool-table':
             self.detail_target = ('pool', key)
         elif event.data_table.id == 'group-table':
             self.detail_target = ('group', key)
@@ -275,6 +357,9 @@ class ConsoleApp(App):
             self.detail_target = ('group', str(json.loads(key)[0]))
         else:
             return
+        self._selected_layout = None
+        self._layout_data = None
+        self.query_one('#bucket-details', Collapsible).collapsed = True
         self.query_one('#detail', Static).update('Loading…')
         self._table('layout-table', [])
         self.query_one('#views', TabbedContent).active = 'layouts'
