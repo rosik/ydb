@@ -1,5 +1,6 @@
 import gc
 import io
+from itertools import permutations
 import json
 import os
 from pathlib import Path
@@ -719,6 +720,17 @@ class TestCLI(unittest.TestCase):
 
 
 class TestScanReportValidation(unittest.TestCase):
+    def test_local3_and_local2_normalize_permutations_and_unknown_realms(self):
+        cases = [('2+1+1', '2+1+1', '2+1'), ('1+2+?', '2+1+?', '2+1'),
+                 ('0+?+0', '0+0+?', '0+0'), ('3+?+?', '3+?+?', '3+?'),
+                 ('?+?+?', '?+?+?', '?+?'), ('1+3+2', '3+2+1', '3+2')]
+        for source, local3, local2 in cases:
+            for parts in set(permutations(source.split('+'))):
+                local = '+'.join(parts)
+                with self.subTest(local=local):
+                    self.assertEqual(write2x2_report.local3(local), local3)
+                    self.assertEqual(write2x2_report.local2(local), local2)
+
     def test_annotated_buckets_remain_distinct_from_legacy_and_other_annotations(self):
         report = scan_report(blobs=2)
         legacy = report['buckets'][0]

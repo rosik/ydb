@@ -72,6 +72,12 @@ class ConsoleApp(App):
     #toolbar { height: 3; padding: 0 1; }
     #toolbar Button { min-width: 12; margin-right: 1; }
     #views { height: 1fr; }
+    #views Tab { color: $foreground; text-style: not dim; }
+    #views Tab.-active { text-style: bold; }
+    #views Tabs:focus Tab.-active {
+        color: $block-cursor-foreground;
+        text-style: $block-cursor-text-style;
+    }
     TabPane { padding: 0 1; }
     DataTable, RichLog { height: 1fr; }
     .hint { height: auto; color: $text-muted; }
@@ -86,9 +92,9 @@ class ConsoleApp(App):
         'pool-table': ('Pool', 'Key', 'Reports', 'Full', 'Partial', 'Never', 'Outdated', 'Stale',
                        'Failed', 'Blobs', 'Size', 'Oldest'),
         'group-table': ('Group', 'Pool', 'Generation', 'Scan age', 'Candidates', 'Worker', 'Due', 'Error'),
-        'layout-table': ('Local', 'Blobs', 'Size', 'phantom_like', 'write2x2-candidate'),
+        'layout-table': ('Local2', 'Blobs', 'Size', 'phantom_like', 'write2x2-candidate'),
         'gc-table': ('GC', 'Blobs', 'Size'),
-        'bucket-table': ('Ingress', 'GC', 'Blobs', 'Size', 'Replica size', 'Missing metadata',
+        'bucket-table': ('Local', 'Local3', 'Ingress', 'GC', 'Blobs', 'Size', 'Replica size', 'Missing metadata',
                          'phantom_like', 'write2x2-candidate'),
         'worker-table': ('Worker', 'Last seen', 'Info'),
         'finding-table': ('Group', 'Blob', 'Status', 'First seen', 'Last seen', 'Coverage'),
@@ -107,7 +113,7 @@ class ConsoleApp(App):
         self._selected_layout = None
 
     def compose(self) -> ComposeResult:
-        yield Header(show_clock=True)
+        yield Header(show_clock=True, icon='>')
         yield Static('Connecting…', id='status', markup=False)
         yield Static('', id='summary', markup=False)
         with Horizontal(id='toolbar'):
@@ -128,11 +134,12 @@ class ConsoleApp(App):
                              + [(gc, gc) for gc in sorted(write2x2_report.GC_STATES)],
                              value='active', allow_blank=False, id='layout-filter')
                 yield Static('Local: ? = incomplete realm; 0 = all three VDisks scanned, no part. '
-                             'Enter: ingress / GC details. mixed = yes / blobs; unknown = annotation unavailable.', classes='hint')
+                             'Local3: descending, ? last. Local2: first two of Local3. '
+                             'Enter: Local / ingress / GC details. mixed = yes / blobs; unknown = annotation unavailable.', classes='hint')
                 yield DataTable(id='layout-table', cursor_type='row', zebra_stripes=True)
                 with Collapsible(title='GC', collapsed=True, id='gc-summary'):
                     yield DataTable(id='gc-table', cursor_type='row', zebra_stripes=True)
-                with Collapsible(title='Select a Local row with Enter for details', collapsed=True, id='bucket-details'):
+                with Collapsible(title='Select a Local2 row with Enter for details', collapsed=True, id='bucket-details'):
                     yield DataTable(id='bucket-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Workers', id='workers'):
                 yield DataTable(id='worker-table', cursor_type='row', zebra_stripes=True)
@@ -307,13 +314,13 @@ class ConsoleApp(App):
         self.query_one('#detail', Static).update(text)
         by_local = {}
         for bucket in visible:
-            by_local.setdefault(bucket['local'], []).append(bucket)
+            by_local.setdefault(write2x2_report.local2(bucket['local']), []).append(bucket)
         rows = []
         for local, items in by_local.items():
             counts = write2x2_report.totals(items)
             rows.append((local, (local, counts['blobs'], size(counts['logical_bytes']),
                                 *(annotation(items, key) for key in write2x2_report.ANNOTATIONS))))
-        rows.sort(key=lambda row: (-row[1][1], row[0]))
+        rows.sort(key=lambda row: row[0])
         self._table('layout-table', rows)
         gc_rows = []
         for gc in sorted(DISCARDED_GC):
@@ -328,14 +335,16 @@ class ConsoleApp(App):
         self._render_bucket_details(visible)
 
     def _render_bucket_details(self, visible):
-        items = [b for b in visible if b['local'] == self._selected_layout]
+        items = [b for b in visible if write2x2_report.local2(b['local']) == self._selected_layout]
         self.query_one('#bucket-details', Collapsible).title = (
-            'Local ' + self._selected_layout + ' · ingress / GC details' if items
-            else 'Select a Local row with Enter for details')
+            'Local2 ' + self._selected_layout + ' · Local / ingress / GC details' if items
+            else 'Select a Local2 row with Enter for details')
         self._table('bucket-table', [(str(i), (
-            b['ingress'], b['gc'], b['blobs'], size(b['logical_bytes']), size(b['observed_replica_bytes']),
+            b['local'], write2x2_report.local3(b['local']), b['ingress'], b['gc'], b['blobs'],
+            size(b['logical_bytes']), size(b['observed_replica_bytes']),
             b['missing_metadata_blobs'], *(annotation([b], key) for key in write2x2_report.ANNOTATIONS)))
-            for i, b in enumerate(sorted(items, key=lambda b: (-b['blobs'], b['ingress'], b['gc'])))])
+            for i, b in enumerate(sorted(items, key=lambda b: (
+                write2x2_report.local3(b['local']), b['local'], b['ingress'], b['gc'])))])
 
     def on_select_changed(self, event: Select.Changed):
         if event.select.id == 'layout-filter' and self._layout_data:

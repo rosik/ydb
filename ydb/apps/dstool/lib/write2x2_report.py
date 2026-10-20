@@ -8,6 +8,16 @@ METRICS = ('blobs', 'logical_bytes', 'observed_replica_bytes', 'missing_metadata
 ANNOTATIONS = ('phantom_like', 'write2x2_candidate')
 
 
+def local3(local):
+    """Order observed realm counts descending, with unknown realms last."""
+    return '+'.join(sorted(local.split('+'), key=lambda part: -1 if part == '?' else int(part), reverse=True))
+
+
+def local2(local):
+    """Keep the first two realms of Local3, dropping the smallest or unknown."""
+    return local3(local).rsplit('+', 1)[0]
+
+
 def bucket_key(bucket):
     return tuple(bucket[key] for key in ('local', 'ingress', 'gc')) + tuple(bucket.get(key) for key in ANNOTATIONS)
 

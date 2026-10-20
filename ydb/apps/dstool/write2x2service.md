@@ -80,16 +80,24 @@ It displays pools, groups, layout histograms, workers and unresolved findings.
 Select a pool or group with **Enter** to open its histogram; Enter on a finding
 opens its group. Local layout `?` means incomplete coverage of that realm;
 `0` means all three VDisks were scanned and no local part was observed.
-The main histogram groups by Local and shows blob counts, logical size,
-`phantom_like` and `write2x2-candidate`. Enter on a Local row opens its ingress/GC
-breakdown, replica size and missing metadata. Sizes choose B/KiB/MiB/GiB automatically.
+`Local` retains group failrealm order. `Local3` sorts its three counts descending,
+with `?` last. `Local2` drops the last entry of Local3 (the smallest count or `?`).
+For example, `1+2+1` becomes Local3 `2+1+1` and Local2 `2+1`; `1+?+2` becomes
+Local3 `2+1+?` and also Local2 `2+1`. Failrealm permutations have equivalent
+replica distributions in mirror-3-dc.
+
+The main histogram groups by Local2 and sorts Local2 ascending, with known
+counts before `?`. It shows blob counts, logical size, `phantom_like` and
+`write2x2-candidate`. Enter on a Local2 row opens its original Local, Local3,
+ingress/GC breakdown, replica size and missing metadata.
+Sizes choose B/KiB/MiB/GiB automatically.
 Ingress columns show metadata claims.
 
 The default GC filter includes `soft_with_keep` and `no_covering_barrier`.
 Choose either separately, any other GC state, or all states in the selector.
 `hard_barrier`, `do_not_keep` and `soft_without_keep` have a collapsed GC summary.
 Annotation columns display `yes`, `no`, or `mixed (N/total)` when only N blobs
-in the Local row have the flag. `unknown` means the report lacks the annotation;
+in the Local2 row have the flag. `unknown` means the report lacks the annotation;
 old reports remain readable. The flags come from blobsan, including for observation-only
 workers; the client does not infer them from Local or ingress. Each refresh replaces
 the displayed histogram. Each group contributes only its latest successful scan.

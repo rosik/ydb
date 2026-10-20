@@ -76,15 +76,17 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
         await pilot.click(app.query_one('#views', TabbedContent).get_tab(name))
         await self.settle(app, pilot)
 
-    def replace_report(self, buckets):
-        self.master.console('scan %d' % self.gid)
+    def replace_report(self, buckets, completed=tuple(range(6)), gid=None):
+        gid = self.gid if gid is None else gid
+        self.master.console('scan %d' % gid)
         job = self.master.rpc('/claim', dict(worker='worker-1'))['job']
-        self.assertEqual(job['layout']['id'], self.gid)
+        self.assertEqual(job['layout']['id'], gid)
         now = time.time()
-        report = dict(version=1, group_id=self.gid, completed_vdisks=list(range(6)),
+        report = dict(version=1, group_id=gid, completed_vdisks=list(completed),
                       buckets=buckets, totals=write2x2_report.totals(buckets))
-        self.master.rpc('/result', dict(worker='worker-1', group=self.gid, token=job['token'], result=dict(
-            findings={}, findings_complete=False, completed_vdisks=list(range(6)), missing_vdisks=[6, 7, 8],
+        self.master.rpc('/result', dict(worker='worker-1', group=gid, token=job['token'], result=dict(
+            findings={}, findings_complete=False, completed_vdisks=list(completed),
+            missing_vdisks=sorted(set(range(9)) - set(completed)),
             scan_report=report, started_at=now - 1, finished_at=now)))
 
     async def open_pool(self, app, pilot):
@@ -104,7 +106,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await self.settle(app, pilot)
             self.assertEqual(app.detail_target, ('pool', '1:7'))
             layout = app.query_one('#layout-table', DataTable)
-            self.assertEqual([str(c) for c in layout.get_row_at(0)], ['1+1+?', '4', '4.0 KiB', 'no', 'yes'])
+            self.assertEqual([str(c) for c in layout.get_row_at(0)], ['1+1', '4', '4.0 KiB', 'no', 'yes'])
             await self.tab(app, pilot, 'groups')
             groups = app.query_one('#group-table', DataTable)
             self.assertEqual(groups.row_count, 2, str(app.query_one('#status', Static).content))
@@ -154,14 +156,14 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await self.open_pool(app, pilot)
             table = app.query_one('#layout-table', DataTable)
             self.assertEqual(table.row_count, 2)
-            self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2+?', '10', '10.0 KiB', 'no', 'no'])
-            self.assertEqual([str(c) for c in table.get_row_at(1)],
-                             ['1+1+?', '6', '6.0 KiB', 'mixed (2/6)', 'mixed (3/6)'])
+            self.assertEqual([str(c) for c in table.get_row_at(0)],
+                             ['1+1', '6', '6.0 KiB', 'mixed (2/6)', 'mixed (3/6)'])
+            self.assertEqual([str(c) for c in table.get_row_at(1)], ['2+2', '10', '10.0 KiB', 'no', 'no'])
             summary = app.query_one('#gc-summary', Collapsible)
             self.assertTrue(summary.collapsed)
             self.assertIn('23 blobs', summary.title)
             self.assertEqual(app.query_one('#gc-table', DataTable).row_count, 3)
-            table.move_cursor(row=1)
+            table.move_cursor(row=0)
             table.focus()
             await pilot.press('enter')
             await pilot.pause()
@@ -169,14 +171,15 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             details = app.query_one('#bucket-table', DataTable)
             self.assertEqual(details.row_count, 3)
             self.assertEqual([str(c) for c in details.get_row_at(0)],
-                             ['1+1+1', 'no_covering_barrier', '3', '3.0 KiB', '6.0 KiB', '0', 'no', 'yes'])
+                             ['1+1+?', '1+1+?', '1+1+1', 'no_covering_barrier', '3',
+                              '3.0 KiB', '6.0 KiB', '0', 'no', 'yes'])
             self.assertNotIn('Excluded:', str(app.query_one('#detail', Static).content))
             app.query_one('#layout-filter', Select).value = 'soft_with_keep'
             await pilot.pause()
-            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1+?', '2', '2.0 KiB', 'yes', 'no'])
+            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '2', '2.0 KiB', 'yes', 'no'])
             app.query_one('#layout-filter', Select).value = 'all'
             await pilot.pause()
-            self.assertEqual([str(c) for c in table.get_row_at(0)][:3], ['1+1+?', '29', '29.0 KiB'])
+            self.assertEqual([str(c) for c in table.get_row_at(0)][:3], ['1+1', '29', '29.0 KiB'])
             self.assertEqual(details.row_count, 6)
 
     async def test_pool_refresh_replaces_previous_scan_instead_of_adding_to_it(self):
@@ -192,7 +195,40 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
                 app.action_refresh()
                 await self.settle(app, pilot)
                 self.assertEqual(table.row_count, 1)
-                self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2+?', '1', '1.0 GiB', 'unknown', 'unknown'])
+                self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2', '1', '1.0 GiB', 'unknown', 'unknown'])
+
+    async def test_local2_merges_permutations_and_third_realm_and_sorts_ascending(self):
+        def bucket(local, blobs, phantom=False, candidate=False):
+            return dict(local=local, ingress='3+3+3', gc='soft_with_keep', blobs=blobs,
+                        logical_bytes=100 * blobs, observed_replica_bytes=200 * blobs,
+                        missing_metadata_blobs=blobs if phantom else 0,
+                        phantom_like=phantom, write2x2_candidate=candidate)
+
+        self.replace_report([
+            bucket('2+2+2', 100), bucket('2+1+1', 3), bucket('1+2+1', 4, phantom=True),
+            bucket('1+1+2', 5), bucket('2+1+0', 6, candidate=True), bucket('0+0+0', 1, phantom=True),
+            bucket('3+1+1', 2), bucket('1+0+0', 30, phantom=True),
+        ], completed=range(9))
+        self.replace_report([bucket('2+2+?', 7), bucket('1+0+?', 8, phantom=True)], gid=self.gid + 1)
+        app = self.app()
+        async with app.run_test(size=(150, 50)) as pilot:
+            await self.open_pool(app, pilot)
+            table = app.query_one('#layout-table', DataTable)
+            self.assertEqual([str(row[0]) for row in (table.get_row_at(i) for i in range(table.row_count))],
+                             ['0+0', '1+0', '2+1', '2+2', '3+1'])
+            self.assertEqual([str(table.get_row_at(i)[1]) for i in range(table.row_count)],
+                             ['1', '38', '18', '107', '2'])
+            self.assertEqual([str(cell) for cell in table.get_row_at(2)][3:], ['mixed (4/18)', 'mixed (6/18)'])
+            table.move_cursor(row=2)
+            table.focus()
+            await pilot.press('enter')
+            await pilot.pause()
+            details = app.query_one('#bucket-table', DataTable)
+            self.assertEqual(details.row_count, 4)
+            self.assertEqual([str(details.get_row_at(i)[0]) for i in range(details.row_count)],
+                             ['2+1+0', '1+1+2', '1+2+1', '2+1+1'])
+            self.assertEqual([str(details.get_row_at(i)[1]) for i in range(details.row_count)],
+                             ['2+1+0', '2+1+1', '2+1+1', '2+1+1'])
 
     async def test_buttons_and_raw_commands(self):
         app = self.app()
