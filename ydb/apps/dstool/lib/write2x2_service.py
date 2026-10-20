@@ -480,7 +480,7 @@ def run_blobsan(args, gid, directory, cancel):
     check_running(cancel)
     report = directory / 'blobsan.err'
     with (directory / 'snapshot').open('rb') as inp, report.open('wb') as err:
-        process = subprocess.Popen([args.blobsan, 'mirror-3-dc'],
+        process = subprocess.Popen([args.blobsan, '--write2x2-candidates', 'mirror-3-dc'],
                                    stdin=inp, stdout=subprocess.DEVNULL, stderr=err)
         try:
             deadline = time.monotonic() + args.scan_timeout

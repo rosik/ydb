@@ -32,7 +32,7 @@ def add_options(parser):
     master.add_argument('--lease', type=positive, default=120)
     worker = sub.add_parser('worker', help='Scan and repair one group at a time')
     worker.add_argument('--master', required=True, help='HOST:PORT or URL of coordinator')
-    worker.add_argument('--blobsan', default='~/blobsan', help='Path to the patched black-box analyzer')
+    worker.add_argument('--blobsan', default='~/blobsan', help='Path to blobsan supporting --write2x2-candidates')
     worker.add_argument('--scan-timeout', type=positive, default=3600)
     worker.add_argument('--poll', type=positive, default=5)
     worker.add_argument('--heartbeat', type=positive, default=20, help='Must be shorter than master lease')

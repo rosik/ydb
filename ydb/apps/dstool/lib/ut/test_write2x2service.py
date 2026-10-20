@@ -321,7 +321,7 @@ class TestWorker(unittest.TestCase):
     def test_relative_blobsan_runs_checked_executable(self):
         binary = self.directory / 'blobsan'
         binary.write_text('#!/bin/sh\n'
-                          '[ "$1" = mirror-3-dc ] || exit 2\n'
+                          '[ "$#" -eq 2 ] && [ "$1" = --write2x2-candidates ] && [ "$2" = mirror-3-dc ] || exit 2\n'
                           'IFS= read -r snapshot\n'
                           '[ "$snapshot" = "opaque snapshot bytes" ] || exit 3\n'
                           "printf '%s\\n' 'GroupId# 1 BlobId# " + BLOB + "' >&2\n")

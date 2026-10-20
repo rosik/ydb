@@ -2,10 +2,11 @@
 
 `dstool cluster write2x2service` runs outside `ydbd`. It discovers conventional
 `mirror-3-dc` groups, scans VDisk metadata, and issues `blob_range` requests with
-`mustRestoreFirst=1` for blobs whose local parts are visible in only one realm.
+`mustRestoreFirst=1` for blobs whose observed local-part layout is incomplete.
 It repeats the scan after repair and continues monitoring for new candidates.
-The service lives in the built `dstool` binary. Workers also need the patched
-`blobsan` executable from `blobstorage-scripts/write2x2/`. It is invoked as a
+The service lives in the built `dstool` binary. Workers also need the
+`blobsan` executable built from `ydb/tools/blobsan`, with support for
+`--write2x2-candidates`. It is invoked as a
 black box; the service does not reproduce its analysis logic. No Python
 installation, shared database, or new server code is required. The service uses
 Python's standard library and dstool's existing connection/configuration code.
@@ -50,7 +51,7 @@ separately to use the new binary. Credentials are not copied.
 To copy both executables to worker hosts:
 
 ```bash
-for host in host1 host2; do scp ./apps/dstool/ydb-dstool "$host:dstool.new" && scp ./blobstorage-scripts/write2x2/blobsan "$host:blobsan.new" && ssh "$host" 'chmod +x ~/dstool.new ~/blobsan.new && mv -f ~/dstool.new ~/dstool && mv -f ~/blobsan.new ~/blobsan'; done
+for host in host1 host2; do scp ./apps/dstool/ydb-dstool "$host:dstool.new" && scp ./tools/blobsan/blobsan "$host:blobsan.new" && ssh "$host" 'chmod +x ~/dstool.new ~/blobsan.new && mv -f ~/dstool.new ~/dstool && mv -f ~/blobsan.new ~/blobsan'; done
 ```
 
 ## Console
@@ -131,7 +132,8 @@ The missing indexes and errors are recorded, even for an accepted pass. A
 six-VDisk scan is not a health certificate for all nine VDisks. Snapshots across
 VDisk are not atomic. Empty initial streams are valid empty indexes.
 
-The assembled snapshot is passed as stdin to `blobsan mirror-3-dc`. Stdout goes
+The assembled snapshot is passed as stdin to
+`blobsan --write2x2-candidates mirror-3-dc`. Stdout goes
 to `/dev/null`, as in the original scripts (this also disables verbose output
 in blobsan). Stderr is saved and only `GroupId# ... BlobId# ...` lines are parsed.
 The supplied executable is the sole authority on candidate selection and
@@ -139,8 +141,8 @@ snapshot payload validation. A nonzero exit, timeout, or malformed candidate
 line fails the pass. The process is terminated on cancellation or lease loss.
 The service itself does not check ingress, GC barriers, or replication layout
 inside the snapshot. Transport completion plus analyzer success is not an
-independent proof of complete or consistent metadata. Use the intended patched
-analyzer; a different executable can produce different candidates.
+independent proof of complete or consistent metadata. The analyzer must support
+`--write2x2-candidates`; the ordinary diagnostic mode selects different blobs.
 
 `request_ok` means `blob_range` returned the requested blob with `Status=OK`;
 `absent` means it returned an empty list. Neither removes a finding. A later
