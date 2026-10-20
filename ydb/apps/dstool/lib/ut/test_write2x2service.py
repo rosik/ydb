@@ -96,6 +96,17 @@ class TestMaster(unittest.TestCase):
         self.assertEqual(pool['totals']['blobs'], 4)
         self.assertEqual(pool['totals']['logical_bytes'], 400)
 
+    def test_groups_brief_omits_reports_and_includes_pool_identity(self):
+        self.observation(self.claim())
+        group = json.loads(self.master.console('groups brief'))
+        self.assertEqual(group['id'], 1)
+        self.assertEqual(group['pool'], 'static')
+        self.assertEqual(group['pool_key'], 'static')
+        self.assertEqual(group['generation'], 1)
+        self.assertNotIn('last_result', group)
+        self.assertNotIn('layout', group)
+        self.assertIn('last_result', json.loads(self.master.console('groups')))
+
     def test_observation_accepts_partial_coverage_and_preserves_findings(self):
         self.result(self.claim(), {BLOB: 'request_ok'})
         self.master.console('scan 1')
@@ -680,11 +691,22 @@ class TestCLI(unittest.TestCase):
 
     def test_commands_parse(self):
         for tail in (['master', '-l', '22570', '--db', '/tmp/master', '--console-sock', '/tmp/socket'],
-                     ['worker', '--master', 'host:22570', '--db', '/tmp/worker']):
+                     ['worker', '--master', 'host:22570', '--db', '/tmp/worker'],
+                     ['client', '--console-sock', '/tmp/socket']):
             parser = ArgumentParser()
             commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
             parsed = parser.parse_args(['cluster', 'write2x2service'] + tail)
             self.assertEqual(parsed.write2x2_action, tail[0])
+
+    def test_client_needs_no_db_or_endpoint(self):
+        with patch.object(common, 'connection_params', common.ConnectionParams()), \
+                patch.object(common, 'apply_args'), patch.object(commands, 'run_command') as run:
+            cli.main(['cluster', 'write2x2service', 'client', '--console-sock', '/tmp/socket'])
+        parsed = run.call_args.args[1]
+        self.assertEqual(parsed.write2x2_action, 'client')
+        self.assertEqual(parsed.console_sock, '/tmp/socket')
+        self.assertEqual(parsed.refresh, 5)
+        self.assertFalse(hasattr(parsed, 'db'))
 
     def test_scan_only_flag(self):
         parser = ArgumentParser()

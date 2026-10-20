@@ -424,6 +424,17 @@ class Master:
                 return json.dumps(stats, indent=2)
             elif op in ('groups', 'workers', 'findings'):
                 if op == 'groups':
+                    if words[1:] == ['brief']:
+                        rows = self.db.execute('''SELECT id,layout,owner,expires,due,last_scan,last_count,error
+                            FROM groups ORDER BY id''')
+                        result = []
+                        for row in rows:
+                            item = dict(row)
+                            layout = json.loads(item.pop('layout'))
+                            item.update(generation=layout['generation'], pool=layout.get('pool'),
+                                        pool_key=pool_identity(layout))
+                            result.append(json.dumps(item))
+                        return '\n'.join(result) or '(empty)'
                     query, values = ('SELECT id,owner,expires,due,last_scan,last_count,error,last_result FROM groups ORDER BY id', ())
                 elif op == 'workers':
                     query, values = ('SELECT * FROM workers ORDER BY seen DESC', ())
@@ -433,7 +444,7 @@ class Master:
                     query, values = ('SELECT * FROM findings WHERE active=1 LIMIT 1000', ())
                 return '\n'.join(json.dumps(dict(r)) for r in self.db.execute(query, values)) or '(empty)'
             elif op == 'help':
-                return 'stats | groups | layouts GROUP | pools [POOL] | workers | findings [GROUP] (max 1000) | pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit'
+                return 'stats | groups [brief] | layouts GROUP | pools [POOL] | workers | findings [GROUP] (max 1000) | pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit'
             else:
                 raise ValueError('Unknown command; use help')
         return 'OK'

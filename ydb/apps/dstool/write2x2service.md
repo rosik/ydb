@@ -9,7 +9,8 @@ The service lives in the built `dstool` binary. Workers also need the
 `--write2x2-candidates`. It is invoked as a
 black box; the service does not reproduce its analysis logic. No Python
 installation, shared database, or new server code is required. The service uses
-Python's standard library and dstool's existing connection/configuration code.
+Python's standard library and dstool's existing connection/configuration code;
+the terminal client uses Textual, as does `tools/mnc/viewer`.
 Master, worker, and the console require POSIX (Linux is the deployment target).
 
 Every successful scan produces a histogram of **all observed blobs**, before
@@ -68,13 +69,34 @@ for host in host1 host2; do scp ./apps/dstool/ydb-dstool "$host:dstool.new" && s
 
 The Unix socket is created with mode **0777**, as requested. Anyone who can
 access it can run console commands. No shell commands are executed by the
-console. Use `telnet -U /tmp/w2x2.sock` if your telnet supports Unix sockets,
-or `socat - UNIX-CONNECT:/tmp/w2x2.sock`. Stats are printed on connection.
+console. Start the built-in terminal client on the master host:
+
+```bash
+dstool cluster write2x2service client --console-sock /tmp/w2x2.sock
+```
+
+The client needs only the socket, without `--db`, credentials or cluster access.
+It displays pools, groups, layout histograms, workers and unresolved findings.
+Select a pool or group with **Enter** to open its histogram; Enter on a finding
+opens its group. Local layout `?` means incomplete coverage of that realm;
+`0` means all three VDisks were scanned and no local part was observed.
+Ingress columns show metadata claims. Byte totals are displayed in KiB (1024 bytes).
+
+The active view and service stats refresh every 5 seconds (`client --refresh SEC`).
+**F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses the
+command input, and **Ctrl+Q** exits. Buttons pause/resume job assignment, schedule
+all groups for scanning, and refresh inventory. The command input accepts all
+commands below; responses appear in the Console tab. `quit` also exits the client.
+
+After connection loss the client retains the last displayed data, marks it stale,
+and reconnects on the next refresh. Requests have a 10-second deadline
+(`client --request-timeout SEC`). A failed interactive command is never retried
+automatically: its effect may already have been applied by the master.
 
 | Command | Effect |
 |---|---|
 | `stats` | Discovery status, scans, candidate totals, unresolved findings, live workers, stale inventory and missing VDisks |
-| `groups` | Per-group scan time, candidate count, coverage, repair response counts, owner, scheduling and errors |
+| `groups` / `groups brief` | Per-group scan time, candidate count, coverage, repair response counts, owner, scheduling and errors; `brief` omits full reports and includes pool identity/generation |
 | `layouts GROUP` | Last successful histogram with captured/missing VDisks, stream errors, scan timestamps, generation and latest attempt error |
 | `pools [POOL]` | Histograms summed over the latest reports per group; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
 | `workers` | Known workers and last contact timestamps |
@@ -89,8 +111,9 @@ or `socat - UNIX-CONNECT:/tmp/w2x2.sock`. Stats are printed on connection.
 Intervals and pause state persist in SQLite. `--interval` (default 3600 seconds)
 and `--retry` (60) initialize a new database; subsequently use the console.
 Changed intervals apply when scheduling the next completed job; `scan all`
-also resets previously scheduled due times. The console is request/response,
-not a continuous terminal dashboard. Times in detailed rows are Unix timestamps.
+also resets previously scheduled due times. The socket retains its plain-text
+request/response protocol for other clients. Times in raw console rows are Unix
+timestamps; dashboard tables display ages.
 
 ## Scheduling and persistence
 
