@@ -14,9 +14,9 @@ from unittest.mock import patch
 import warnings
 
 from ydb.apps.dstool import main as cli
-from ydb.apps.dstool.lib import write2x2_service as svc
+from ydb.apps.dstool.lib import blobsan_service as svc
 from ydb.apps.dstool.lib import commands, common, write2x2_report
-from ydb.apps.dstool.lib import dstool_cmd_cluster_write2x2service as service_command
+from ydb.apps.dstool.lib import dstool_cmd_blobsan_service as service_command
 from ydb.apps.dstool.lib.arg_parser import ArgumentParser
 from ydb.core.protos import blobstorage_config_pb2 as bsconfig
 
@@ -483,7 +483,7 @@ class TestWorker(unittest.TestCase):
             with patch.dict(os.environ, {'PATH': str(decoy_dir)}), \
                     patch.object(common, 'connection_params', common.ConnectionParams()), \
                     patch.object(svc, 'work', side_effect=work) as worker:
-                service_command.do(args(write2x2_action='worker', dry_run=False,
+                service_command.do(args(blobsan_service_action='worker', dry_run=False,
                                         blobsan='./blobsan', db=str(self.directory / 'db')))
                 worker.assert_called_once()
         finally:
@@ -666,7 +666,7 @@ class TestCLI(unittest.TestCase):
     def test_service_endpoint_default_and_explicit_spellings(self):
         for action, tail in [('master', ['--console-sock', '/tmp/socket']),
                              ('worker', ['--master', 'host:22570'])]:
-            command = ['cluster', 'write2x2service', action, '--db', '/tmp/db'] + tail
+            command = ['blobsan-service', action, '--db', '/tmp/db'] + tail
             for endpoints, expected in [([], ['localhost']),
                                         (['-eremote.example'], ['remote.example']),
                                         (['-e', 'remote.example'], ['remote.example']),
@@ -697,16 +697,19 @@ class TestCLI(unittest.TestCase):
                      ['worker', '--master', 'host:22570', '--db', '/tmp/worker'],
                      ['client', '--console-sock', '/tmp/socket']):
             parser = ArgumentParser()
-            commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
-            parsed = parser.parse_args(['cluster', 'write2x2service'] + tail)
-            self.assertEqual(parsed.write2x2_action, tail[0])
+            command_map = commands.make_command_map_by_structure(
+                parser.add_subparsers(dest='global_command', required=True))
+            parsed = parser.parse_args(['blobsan-service'] + tail)
+            self.assertEqual(parsed.global_command, 'blobsan-service')
+            self.assertEqual(parsed.blobsan_service_action, tail[0])
+            self.assertIs(command_map[parsed.global_command], service_command.do)
 
     def test_client_needs_no_db_or_endpoint(self):
         with patch.object(common, 'connection_params', common.ConnectionParams()), \
                 patch.object(common, 'apply_args'), patch.object(commands, 'run_command') as run:
-            cli.main(['cluster', 'write2x2service', 'client', '--console-sock', '/tmp/socket'])
+            cli.main(['blobsan-service', 'client', '--console-sock', '/tmp/socket'])
         parsed = run.call_args.args[1]
-        self.assertEqual(parsed.write2x2_action, 'client')
+        self.assertEqual(parsed.blobsan_service_action, 'client')
         self.assertEqual(parsed.console_sock, '/tmp/socket')
         self.assertEqual(parsed.refresh, 5)
         self.assertFalse(hasattr(parsed, 'db'))
@@ -714,7 +717,7 @@ class TestCLI(unittest.TestCase):
     def test_scan_only_flag(self):
         parser = ArgumentParser()
         commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
-        parsed = parser.parse_args(['cluster', 'write2x2service', 'worker', '--master', 'host:22570',
+        parsed = parser.parse_args(['blobsan-service', 'worker', '--master', 'host:22570',
                                     '--db', '/tmp/worker', '--scan-only'])
         self.assertTrue(parsed.scan_only)
 

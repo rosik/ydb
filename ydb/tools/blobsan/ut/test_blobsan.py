@@ -504,7 +504,7 @@ class TestScanReport(unittest.TestCase):
         from unittest.mock import patch
         import threading
         import time
-        from ydb.apps.dstool.lib import write2x2_service as svc
+        from ydb.apps.dstool.lib import blobsan_service as svc
 
         binary = yatest.common.binary_path('ydb/tools/blobsan/blobsan')
         args = SimpleNamespace(viewer='http://viewer', request_timeout=5, scan_timeout=30, scan_only=True,

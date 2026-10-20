@@ -10,9 +10,9 @@ from unittest.mock import patch
 
 from textual.widgets import Button, Collapsible, DataTable, Input, RichLog, Select, Static, TabbedContent
 
-from ydb.apps.dstool.lib import dstool_cmd_cluster_write2x2service as command
+from ydb.apps.dstool.lib import dstool_cmd_blobsan_service as command
 from ydb.apps.dstool.lib import common, write2x2_report
-from ydb.apps.dstool.lib import write2x2_service as svc
+from ydb.apps.dstool.lib import blobsan_service as svc
 from ydb.apps.dstool.tui.client import ConsoleApp, size
 from ydb.apps.dstool.tui.connection import ConsoleConnection
 
@@ -308,7 +308,7 @@ class ClientCommandTest(unittest.TestCase):
                          ['0 B', '100 B', '1.0 KiB', '1.0 MiB', '1.0 GiB'])
 
     def test_dispatch_needs_no_service_database_or_cluster_connection(self):
-        args = SimpleNamespace(write2x2_action='client', console_sock='/tmp/test.sock', refresh=3,
+        args = SimpleNamespace(blobsan_service_action='client', console_sock='/tmp/test.sock', refresh=3,
                                request_timeout=7, dry_run=False)
         with patch('ydb.apps.dstool.tui.client.ConsoleApp') as app:
             command.do(args)
@@ -318,5 +318,5 @@ class ClientCommandTest(unittest.TestCase):
     def test_dry_run_rejected_before_starting_client(self):
         with patch('ydb.apps.dstool.tui.client.ConsoleApp') as app, \
                 self.assertRaises(common.InvalidParameterError):
-            command.do(SimpleNamespace(write2x2_action='client', dry_run=True))
+            command.do(SimpleNamespace(blobsan_service_action='client', dry_run=True))
         app.assert_not_called()

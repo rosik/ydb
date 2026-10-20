@@ -38,7 +38,7 @@ class ConsoleConnectionTest(unittest.IsolatedAsyncioTestCase):
         self.handlers.add(asyncio.current_task())
         self.writers.add(writer)
         try:
-            writer.write(b'w2x2 console. help for commands.\r\n{}\r\n> ')
+            writer.write(b'blobsan-service console. help for commands.\r\n{}\r\n> ')
             await writer.drain()
             while line := await reader.readline():
                 command = line.decode().strip()

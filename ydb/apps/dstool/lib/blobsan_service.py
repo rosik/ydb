@@ -1,4 +1,4 @@
-"""Coordinator and worker runtime for cluster write2x2service (standard library)."""
+"""Coordinator and worker runtime for blobsan-service (standard library)."""
 
 import argparse
 import collections
@@ -31,7 +31,7 @@ import uuid
 from ydb.apps.dstool.lib import common, write2x2_report
 
 
-LOG = logging.getLogger('w2x2')
+LOG = logging.getLogger('blobsan-service')
 STOP = threading.Event()
 MAX_BODY = 128 * 1024 * 1024
 CANDIDATE = re.compile(r'GroupId#\s+(\d+)\s+BlobId#\s+(\[(?:\d+:){6}\d+\])')
@@ -314,7 +314,7 @@ class Master:
                     layout = json.loads(row['layout'])
                     self.db.execute('''INSERT OR REPLACE INTO scan_reports
                         VALUES(?,?,?,?,?,?)''', (gid, layout['generation'], layout['fingerprint'],
-                                               started, finished, json.dumps(result)))
+                                                 started, finished, json.dumps(result)))
                 delay = self.setting('retry' if unresolved or len(completed) < 9 else 'interval')
                 if new:
                     LOG.warning('Group %s: %d new/reappeared candidates, %d total', gid, new, len(findings))
@@ -353,8 +353,8 @@ class Master:
             if selector is not None and selector not in (key, name):
                 continue
             pool = pools.setdefault(key, dict(pool_key=key, pool=name, groups=0, reported_groups=0,
-                full_groups=0, partial_groups=0, never_scanned_groups=0, outdated_groups=0,
-                stale_inventory_groups=0, failed_groups=0, oldest_scan=None, newest_scan=None, histogram={}))
+                                              full_groups=0, partial_groups=0, never_scanned_groups=0, outdated_groups=0,
+                                              stale_inventory_groups=0, failed_groups=0, oldest_scan=None, newest_scan=None, histogram={}))
             pool['groups'] += 1
             pool['failed_groups'] += bool(row['error'])
             if row['seen'] < now - self.args.refresh * 2:
@@ -481,7 +481,7 @@ class Console(socketserver.StreamRequestHandler):
         def send(text):
             self.wfile.write((text.replace('\n', '\r\n') + '\r\n> ').encode())
         try:
-            send('w2x2 console. help for commands.\n' + self.server.master.console('stats'))
+            send('blobsan-service console. help for commands.\n' + self.server.master.console('stats'))
             while not STOP.is_set():
                 line = self.rfile.readline(4096)
                 if not line or line.strip() in (b'quit', b'exit'):

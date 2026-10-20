@@ -30,7 +30,7 @@ def main(args=None):
     command_map = commands.make_command_map_by_structure(subparsers)
     args = parser.parse_args(args)
     if not args.endpoint:
-        if args.global_command == 'cluster' and args.cluster_command == 'write2x2service':
+        if args.global_command == 'blobsan-service':
             args.endpoint = ['localhost']
         else:
             print_error_with_usage(parser, 'Value endpoint is required')

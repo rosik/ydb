@@ -1,6 +1,6 @@
 # Continuous blob layout scans and single-DC repair
 
-`dstool cluster write2x2service` runs outside `ydbd`. It discovers conventional
+`dstool blobsan-service` runs outside `ydbd`. It discovers conventional
 `mirror-3-dc` groups, scans VDisk metadata, and issues `blob_range` requests with
 `mustRestoreFirst=1` for blobs whose observed local-part layout is incomplete.
 It repeats the scan after repair and continues monitoring for new candidates.
@@ -22,15 +22,15 @@ omitted; scans with fewer than two complete realms only publish observations.
 ## Start
 
 ```bash
-dstool --token-file ~/.token cluster write2x2service master \
+dstool --token-file ~/.token blobsan-service master \
     -l 22570 --db ~/w2x2_master_db/ --console-sock /tmp/w2x2.sock
 
 # On each selected storage host:
-dstool --token-file ~/.token cluster write2x2service worker \
+dstool --token-file ~/.token blobsan-service worker \
     --master master-host:22570 --db ~/w2x2_worker_db/ --blobsan ~/blobsan
 
 # Observation without repair:
-dstool --token-file ~/.token cluster write2x2service worker \
+dstool --token-file ~/.token blobsan-service worker \
     --master master-host:22570 --db ~/w2x2_observer_db/ --blobsan ~/blobsan --scan-only
 ```
 
@@ -72,7 +72,7 @@ access it can run console commands. No shell commands are executed by the
 console. Start the built-in terminal client on the master host:
 
 ```bash
-dstool cluster write2x2service client --console-sock /tmp/w2x2.sock
+dstool blobsan-service client --console-sock /tmp/w2x2.sock
 ```
 
 The client needs only the socket, without `--db`, credentials or cluster access.

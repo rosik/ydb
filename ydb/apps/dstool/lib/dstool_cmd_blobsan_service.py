@@ -21,7 +21,7 @@ def positive(value):
 
 
 def add_options(parser):
-    sub = parser.add_subparsers(dest='write2x2_action', required=True)
+    sub = parser.add_subparsers(dest='blobsan_service_action', required=True)
     client = sub.add_parser('client', help='Interactive terminal console (Textual)')
     client.add_argument('--console-sock', required=True)
     client.add_argument('--refresh', type=positive, default=5, help='Dashboard refresh interval in seconds')
@@ -53,28 +53,28 @@ def do(args):
     if args.dry_run:
         raise common.InvalidParameterError(
             common.connection_params.parser, '--dry-run', True,
-            'write2x2service does not support --dry-run')
-    if args.write2x2_action == 'client':
+            'blobsan-service does not support --dry-run')
+    if args.blobsan_service_action == 'client':
         from ydb.apps.dstool.tui.client import ConsoleApp
         ConsoleApp(args.console_sock, refresh=args.refresh, timeout=args.request_timeout).run()
         return
 
     # Lazy imports keep non-POSIX dstool commands usable on Windows.
     import fcntl
-    from ydb.apps.dstool.lib import write2x2_service as svc
+    from ydb.apps.dstool.lib import blobsan_service as svc
 
-    if args.write2x2_action == 'worker' and not 0 <= args.repair_delay <= 3600:
+    if args.blobsan_service_action == 'worker' and not 0 <= args.repair_delay <= 3600:
         raise common.InvalidParameterError(
             common.connection_params.parser, '--repair-delay', args.repair_delay,
             'Must be in [0, 3600]')
-    if args.write2x2_action == 'worker':
+    if args.blobsan_service_action == 'worker':
         binary = Path(args.blobsan).expanduser().resolve()
         if not binary.is_file() or not os.access(binary, os.X_OK):
             raise common.InvalidParameterError(
                 common.connection_params.parser, '--blobsan', args.blobsan,
                 'Not an executable file: ' + str(binary))
         args.blobsan = str(binary)
-    if args.write2x2_action == 'master' and args.listen > 65535:
+    if args.blobsan_service_action == 'master' and args.listen > 65535:
         raise common.InvalidParameterError(
             common.connection_params.parser, '--listen', args.listen,
             'Port must be in [1, 65535]')
@@ -88,7 +88,7 @@ def do(args):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         old = {sig: signal.signal(sig, lambda *_: svc.STOP.set()) for sig in (signal.SIGINT, signal.SIGTERM)}
         try:
-            (svc.serve if args.write2x2_action == 'master' else svc.work)(args, directory)
+            (svc.serve if args.blobsan_service_action == 'master' else svc.work)(args, directory)
         finally:
             for sig, handler in old.items():
                 signal.signal(sig, handler)

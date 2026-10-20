@@ -1,4 +1,4 @@
-"""Textual dashboard for write2x2service's local console."""
+"""Textual dashboard for blobsan-service's local console."""
 
 import json
 import shlex
@@ -56,7 +56,7 @@ def json_rows(response):
 
 
 class ConsoleApp(App):
-    TITLE = 'write2x2service'
+    TITLE = 'blobsan-service'
     BINDINGS = [
         Binding('ctrl+q', 'quit', 'Quit'),
         Binding('f5', 'refresh', 'Refresh'),
@@ -176,7 +176,6 @@ class ConsoleApp(App):
         order = ('pools', 'groups', 'layouts', 'workers', 'findings', 'console')
         self.set_focus(tabs.query_one(Tabs))
         tabs.active = order[(order.index(tabs.active) + step) % len(order)]
-
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
         if event.tabbed_content.id == 'views':
@@ -319,7 +318,7 @@ class ConsoleApp(App):
         for local, items in by_local.items():
             counts = write2x2_report.totals(items)
             rows.append((local, (local, counts['blobs'], size(counts['logical_bytes']),
-                                *(annotation(items, key) for key in write2x2_report.ANNOTATIONS))))
+                                 *(annotation(items, key) for key in write2x2_report.ANNOTATIONS))))
         rows.sort(key=lambda row: row[0])
         self._table('layout-table', rows)
         gc_rows = []

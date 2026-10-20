@@ -58,7 +58,8 @@ def validate(report, gid, completed):
         if bucket.get('phantom_like') is not None and bucket['missing_metadata_blobs'] != (
                 bucket['blobs'] if bucket['phantom_like'] else 0):
             raise ValueError('Phantom annotation contradicts missing metadata')
-        if bucket.get('write2x2_candidate') and (bucket.get('phantom_like') is not False or
+        if bucket.get('write2x2_candidate') and (
+                bucket.get('phantom_like') is not False or
                 bucket['gc'] not in ('soft_with_keep', 'no_covering_barrier')):
             raise ValueError('Invalid write2x2 candidate annotation')
         key = bucket_key(bucket)
