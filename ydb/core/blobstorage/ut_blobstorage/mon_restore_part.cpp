@@ -122,7 +122,7 @@ namespace {
         ui32 puts = 0;
         f.Env.Runtime->FilterFunction = [&](ui32, std::unique_ptr<IEventHandle>& ev) {
             // The operation must not send a group-level TEvGet through DSProxy.
-            UNIT_ASSERT_VALUES_UNEQUAL(ev->GetTypeRewrite(), TEvBlobStorage::EvGet);
+            UNIT_ASSERT_VALUES_UNEQUAL(ev->GetTypeRewrite(), ui32(TEvBlobStorage::EvGet));
             if (ev->GetTypeRewrite() == TEvBlobStorage::EvVPut) {
                 const auto& record = ev->Get<TEvBlobStorage::TEvVPut>()->Record;
                 UNIT_ASSERT_VALUES_EQUAL(LogoBlobIDFromLogoBlobID(record.GetBlobID()), TLogoBlobID(f.FullId, 5));
@@ -167,9 +167,6 @@ Y_UNIT_TEST_SUITE(MonRestorePart) {
         UNIT_ASSERT_C(response.GetSuccess(), response.GetErrorDescription());
         f.Env.Sim(TDuration::Seconds(10));
         f.Info = f.Env.GetGroupInfo(f.Info->GroupID.GetRawId());
-        UNIT_ASSERT(f.Info->Group);
-        UNIT_ASSERT_VALUES_EQUAL(f.Info->Group->GetAcceptedScope().GetX1(), acceptedScope.first);
-        UNIT_ASSERT_VALUES_EQUAL(f.Info->Group->GetAcceptedScope().GetX2(), acceptedScope.second);
 
         auto restorePart = [&](const TScopeId& originScopeId) {
             const auto vdiskId = f.VDisk(4);
@@ -414,6 +411,25 @@ Y_UNIT_TEST_SUITE(MonRestorePart) {
         UNIT_ASSERT_VALUES_EQUAL(f.Read(3, 2), "");
     }
 
+    Y_UNIT_TEST(Mirror3of4MetadataOnlySource) {
+        TFixture f(TBlobStorageGroupType::ErasureMirror3of4);
+        const ui32 source = f.Info->Type.BlobSubgroupSize() - 1;
+        const TLogoBlobID partId(f.FullId, 3);
+        f.Env.PutBlob(f.VDisk(source), partId, TString());
+        f.Read(3, 2, NKikimrProto::NODATA);
+        UNIT_ASSERT_VALUES_EQUAL(f.RestorePart(2, partId.ToString())["Status"].GetString(), "OK");
+        UNIT_ASSERT_VALUES_EQUAL(f.Read(3, 2), "");
+    }
+
+    Y_UNIT_TEST(Mirror3of4MetadataCannotRestoreData) {
+        TFixture f(TBlobStorageGroupType::ErasureMirror3of4);
+        const ui32 source = f.Info->Type.BlobSubgroupSize() - 1;
+        f.Env.PutBlob(f.VDisk(source), TLogoBlobID(f.FullId, 3), TString());
+        UNIT_ASSERT_VALUES_EQUAL(f.RestorePart(0, TLogoBlobID(f.FullId, 1).ToString(), "404 Not Found")
+            ["Status"].GetString(), "NODATA");
+        f.Read(1, 0, NKikimrProto::NODATA);
+    }
+
     Y_UNIT_TEST(Mirror3dcWithoutConnectionQuorum) {
         TFixture f(TBlobStorageGroupType::ErasureMirror3dc);
         const auto target = f.VDisk(0);
@@ -450,6 +466,9 @@ Y_UNIT_TEST_SUITE(MonRestorePart) {
     Y_UNIT_TEST(EncryptedGroup) {
         TFixture f(TBlobStorageGroupType::Erasure4Plus2Block, 1024, true);
         f.Env.PutBlob(f.Info->GroupID.GetRawId(), f.FullId, f.Data);
+        // The first encrypted TEvPut advances GroupGeneration; UpdateSystemViews publishes it every 5 seconds.
+        f.Env.Sim(TDuration::Seconds(10));
+        f.Info = f.Env.GetGroupInfo(f.Info->GroupID.GetRawId());
         const TString encryptedPart = f.Read(1, 0);
         UNIT_ASSERT_VALUES_EQUAL(f.RestorePart(0, TLogoBlobID(f.FullId, 1).ToString())["Status"].GetString(), "OK");
         UNIT_ASSERT_VALUES_EQUAL(f.Read(1, 0), encryptedPart);

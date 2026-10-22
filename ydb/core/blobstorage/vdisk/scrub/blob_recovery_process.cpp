@@ -1,7 +1,5 @@
 #include "blob_recovery_impl.h"
 
-#include <bit>
-
 #define YDB_LOG_THIS_FILE_COMPONENT BS_VDISK_SCRUB
 
 namespace NKikimr {
@@ -136,7 +134,7 @@ namespace NKikimr {
                         if (res->GetStatus() == NKikimrProto::OK && id.PartId()
                                 && id.PartId() <= Info->Type.TotalPartCount()) {
                             TRope data = ev->Get()->GetBlobData(*res);
-                            if (data && data.size() == Info->Type.PartSize(id)) {
+                            if (data.size() == Info->Type.PartSize(id)) {
                                 item.SetPartData(id, std::move(data));
                                 update = true;
                             }
@@ -187,7 +185,13 @@ namespace NKikimr {
         if (item.GetAvailableParts().IsSupersetOf(item.Needed)) {
             return NKikimrProto::OK;
         }
-        const ui32 numParts = std::popcount(item.PartsMask);
+        // Empty metadata parts satisfy Needed directly, but cannot reconstruct payload-bearing parts.
+        ui32 numParts = 0;
+        for (ui32 i = 0; i < item.Parts.size(); ++i) {
+            if ((item.PartsMask & (1u << i)) && Info->Type.PartSize(TLogoBlobID(item.BlobId, i + 1))) {
+                ++numParts;
+            }
+        }
         if (numParts >= Info->Type.MinimalRestorablePartCount()) {
             Y_DEBUG_ABORT_UNLESS(item.Parts.size() == Info->Type.TotalPartCount());
 
