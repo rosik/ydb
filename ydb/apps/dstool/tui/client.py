@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
-from textual.widgets import Button, Collapsible, DataTable, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tabs
+from textual.widgets import Button, Checkbox, Collapsible, DataTable, Footer, Header, Input, RichLog, Select, Static, TabbedContent, TabPane, Tabs
 
 from ydb.apps.dstool.lib import write2x2_report
 from ydb.apps.dstool.tui.connection import ConsoleConnection, ConsoleError, CommandError
@@ -83,6 +83,7 @@ class ConsoleApp(App):
     .hint { height: auto; color: $text-muted; }
     #detail { height: auto; max-height: 7; overflow-y: auto; }
     #layout-filter { width: 55; }
+    #annotation-filters { height: auto; }
     #gc-table { height: 5; }
     #bucket-table { height: 10; }
     #gc-summary, #bucket-details { height: auto; padding: 0; }
@@ -92,10 +93,10 @@ class ConsoleApp(App):
         'pool-table': ('Pool', 'Key', 'Reports', 'Full', 'Partial', 'Never', 'Outdated', 'Stale',
                        'Failed', 'Blobs', 'Size', 'Oldest'),
         'group-table': ('Group', 'Pool', 'Generation', 'Scan age', 'Candidates', 'Worker', 'Due', 'Error'),
-        'layout-table': ('Local2', 'Blobs', 'Size', 'phantom_like', 'write2x2-candidate'),
+        'layout-table': ('Local2', 'Blobs', 'Size', 'phantom_like', 'write2x2_candidate'),
         'gc-table': ('GC', 'Blobs', 'Size'),
         'bucket-table': ('Local', 'Local3', 'Ingress', 'GC', 'Blobs', 'Size', 'Replica size', 'Missing metadata',
-                         'phantom_like', 'write2x2-candidate'),
+                         'phantom_like', 'write2x2_candidate'),
         'worker-table': ('Worker', 'Last seen', 'Info'),
         'finding-table': ('Group', 'Blob', 'Status', 'First seen', 'Last seen', 'Coverage'),
     }
@@ -133,6 +134,9 @@ class ConsoleApp(App):
                 yield Select([('soft_with_keep + no_covering_barrier', 'active'), ('all GC states', 'all')]
                              + [(gc, gc) for gc in sorted(write2x2_report.GC_STATES)],
                              value='active', allow_blank=False, id='layout-filter')
+                with Horizontal(id='annotation-filters'):
+                    yield Checkbox('Show phantom_like', value=True, id='show-phantom-like')
+                    yield Checkbox('Show write2x2_candidate only', id='write2x2-candidate-only')
                 yield Static('Local: ? = incomplete realm; 0 = all three VDisks scanned, no part. '
                              'Local3: descending, ? last. Local2: first two of Local3. '
                              'Enter: Local / ingress / GC details. mixed = yes / blobs; unknown = annotation unavailable.', classes='hint')
@@ -303,13 +307,17 @@ class ConsoleApp(App):
                 text += '\nLatest attempt error: ' + data['latest_error']
             if data.get('stream_errors'):
                 text += '\nStream errors: ' + json.dumps(data['stream_errors'], ensure_ascii=False)
+        show_phantom = self.query_one('#show-phantom-like', Checkbox).value
+        candidates_only = self.query_one('#write2x2-candidate-only', Checkbox).value
+        filtered = [b for b in buckets if (show_phantom or b.get('phantom_like') is not True)
+                    and (not candidates_only or b.get('write2x2_candidate') is True)]
         selected_gc = self.query_one('#layout-filter', Select).value
-        visible = [b for b in buckets if selected_gc == 'all' or
+        visible = [b for b in filtered if selected_gc == 'all' or
                    (b['gc'] in ACTIVE_GC if selected_gc == 'active' else b['gc'] == selected_gc)]
         visible_totals = write2x2_report.totals(visible)
         if totals:
             text += (f"\nSelected: {visible_totals['blobs']:,} blobs · {size(visible_totals['logical_bytes'])}"
-                     f" · All GC states: {totals['blobs']:,} blobs · {size(totals['logical_bytes'])}")
+                     f" · Report total: {totals['blobs']:,} blobs · {size(totals['logical_bytes'])}")
         self.query_one('#detail', Static).update(text)
         by_local = {}
         for bucket in visible:
@@ -323,11 +331,11 @@ class ConsoleApp(App):
         self._table('layout-table', rows)
         gc_rows = []
         for gc in sorted(DISCARDED_GC):
-            counts = write2x2_report.totals([b for b in buckets if b['gc'] == gc])
+            counts = write2x2_report.totals([b for b in filtered if b['gc'] == gc])
             if counts['blobs']:
                 gc_rows.append((gc, (gc, counts['blobs'], size(counts['logical_bytes']))))
         self._table('gc-table', gc_rows)
-        discarded = write2x2_report.totals([b for b in buckets if b['gc'] in DISCARDED_GC])
+        discarded = write2x2_report.totals([b for b in filtered if b['gc'] in DISCARDED_GC])
         summary = self.query_one('#gc-summary', Collapsible)
         summary.title = f"GC · {discarded['blobs']:,} blobs · {size(discarded['logical_bytes'])}"
         summary.display = bool(discarded['blobs'])
@@ -347,6 +355,10 @@ class ConsoleApp(App):
 
     def on_select_changed(self, event: Select.Changed):
         if event.select.id == 'layout-filter' and self._layout_data:
+            self._render_layout(*self._layout_data)
+
+    def on_checkbox_changed(self, event: Checkbox.Changed):
+        if event.checkbox.id in ('show-phantom-like', 'write2x2-candidate-only') and self._layout_data:
             self._render_layout(*self._layout_data)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):

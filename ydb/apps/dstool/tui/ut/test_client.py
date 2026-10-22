@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from textual.widgets import Button, Collapsible, DataTable, Input, RichLog, Select, Static, TabbedContent
+from textual.widgets import Button, Checkbox, Collapsible, DataTable, Input, RichLog, Select, Static, TabbedContent
 
 from ydb.apps.dstool.lib import dstool_cmd_blobsan_service as command
 from ydb.apps.dstool.lib import common, write2x2_report
@@ -146,7 +146,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
         buckets = [bucket(3, candidate=True), bucket(2, gc='soft_with_keep', phantom=True),
                    bucket(1, ingress='2+2+2')]
         # A different ingress with the same Local belongs to the same summary row.
-        buckets += [bucket(5, gc='hard_barrier'), bucket(7, gc='soft_without_keep'), bucket(11, gc='do_not_keep')]
+        buckets += [bucket(5, gc='hard_barrier', phantom=True), bucket(7, gc='soft_without_keep'), bucket(11, gc='do_not_keep')]
         large = bucket(10)
         large['local'] = '2+2+?'
         buckets.append(large)
@@ -181,6 +181,36 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual([str(c) for c in table.get_row_at(0)][:3], ['1+1', '29', '29.0 KiB'])
             self.assertEqual(details.row_count, 6)
+            await pilot.click('#show-phantom-like')
+            await pilot.pause()
+            self.assertEqual([str(c) for c in table.get_row_at(0)],
+                             ['1+1', '22', '22.0 KiB', 'no', 'mixed (3/22)'])
+            self.assertEqual(details.row_count, 4)
+            self.assertIn('18 blobs', summary.title)
+            self.assertEqual(app.query_one('#gc-table', DataTable).row_count, 2)
+            self.assertIn('Selected: 32 blobs', str(app.query_one('#detail', Static).content))
+            await pilot.click('#write2x2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(table.row_count, 1)
+            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '3', '3.0 KiB', 'no', 'yes'])
+            self.assertEqual(details.row_count, 1)
+            self.assertFalse(summary.display)
+            app.query_one('#layout-filter', Select).value = 'hard_barrier'
+            await pilot.pause()
+            self.assertEqual(table.row_count, 0)
+            self.assertEqual(details.row_count, 0)
+            app.query_one('#layout-filter', Select).value = 'active'
+            app.action_refresh()
+            await self.settle(app, pilot)
+            self.assertEqual(str(table.get_row_at(0)[1]), '3')
+            self.assertFalse(app.query_one('#show-phantom-like', Checkbox).value)
+            self.assertTrue(app.query_one('#write2x2-candidate-only', Checkbox).value)
+            await pilot.click('#write2x2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(str(table.get_row_at(0)[1]), '4')
+            await pilot.click('#show-phantom-like')
+            await pilot.pause()
+            self.assertEqual(str(table.get_row_at(0)[1]), '6')
 
     async def test_pool_refresh_replaces_previous_scan_instead_of_adding_to_it(self):
         app = self.app()
@@ -196,6 +226,15 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
                 await self.settle(app, pilot)
                 self.assertEqual(table.row_count, 1)
                 self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2', '1', '1.0 GiB', 'unknown', 'unknown'])
+            await pilot.click('#show-phantom-like')
+            await pilot.pause()
+            self.assertEqual(table.row_count, 1)
+            await pilot.click('#write2x2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(table.row_count, 0)
+            await pilot.click('#write2x2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(table.row_count, 1)
 
     async def test_local2_merges_permutations_and_third_realm_and_sorts_ascending(self):
         def bucket(local, blobs, phantom=False, candidate=False):

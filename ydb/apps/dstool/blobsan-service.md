@@ -88,13 +88,19 @@ replica distributions in mirror-3-dc.
 
 The main histogram groups by Local2 and sorts Local2 ascending, with known
 counts before `?`. It shows blob counts, logical size, `phantom_like` and
-`write2x2-candidate`. Enter on a Local2 row opens its original Local, Local3,
+`write2x2_candidate`. Enter on a Local2 row opens its original Local, Local3,
 ingress/GC breakdown, replica size and missing metadata.
 Sizes choose B/KiB/MiB/GiB automatically.
 Ingress columns show metadata claims.
 
 The default GC filter includes `soft_with_keep` and `no_covering_barrier`.
 Choose either separately, any other GC state, or all states in the selector.
+Uncheck **Show phantom_like** to hide buckets explicitly marked `phantom_like`.
+Check **Show write2x2_candidate only** to include only buckets explicitly marked
+`write2x2_candidate`. Both checkboxes apply together with the GC selector before
+Local2 aggregation and detail counts; the collapsed GC summary also respects
+the checkboxes. By default, `phantom_like` is shown and candidates-only is off.
+Reports without annotations remain visible unless candidates-only is enabled.
 `hard_barrier`, `do_not_keep` and `soft_without_keep` have a collapsed GC summary.
 Annotation columns display `yes`, `no`, or `mixed (N/total)` when only N blobs
 in the Local2 row have the flag. `unknown` means the report lacks the annotation;
