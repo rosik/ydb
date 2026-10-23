@@ -1,52 +1,52 @@
-# Continuous blob layout scans and single-DC repair
+# Continuous blob layout scans and restore candidates
 
-`dstool blobsan-service` runs outside `ydbd`. It discovers conventional
-`mirror-3-dc` groups, scans VDisk metadata, and issues `blob_range` requests with
-`mustRestoreFirst=1` for blobs whose observed local-part layout is incomplete.
-It repeats the scan after repair and continues monitoring for new candidates.
-The service lives in the built `dstool` binary. Workers also need the
-`blobsan` executable built from `ydb/tools/blobsan`, with support for
-`--write2x2-candidates`. It is invoked as a
-black box; the service does not reproduce its analysis logic. No Python
-installation, shared database, or new server code is required. The service uses
-Python's standard library and dstool's existing connection/configuration code;
-the terminal client uses Textual, as does `tools/mnc/viewer`.
-Master, worker, and the console require POSIX (Linux is the deployment target).
+`dstool blobsan-service` discovers conventional `mirror-3-dc` groups, scans
+VDisk metadata, and collects restore candidate BlobIds on a master. Workers
+run `blobsan` once per snapshot with `--restore-canidates` to collect both
+`inv1_candidate` and `inv2_candidate`. Workers issue no blob repair requests.
 
-Every successful scan produces a histogram of **all observed blobs**, before
-candidate filtering, including full layouts and GC metadata. Use worker
-`--scan-only` to collect these reports without issuing repair requests. Recovery
-continues to use the existing `mustRestoreFirst` behavior when that option is
-omitted; scans with fewer than two complete realms only publish observations.
+`MinRedundancyPerDc` is the minimum observed replica count across fully captured
+datacenters, ignoring `?` realms. Eligible, restorable blobs enter `inv1_candidate` when
+`MinRedundancyPerDc < 1` and `inv2_candidate` when `MinRedundancyPerDc < 2`.
+With no fully captured datacenter, neither category is selected. Within each
+scan, `inv1_candidate` is a subset of `inv2_candidate`. These lists describe
+captured metadata and can change as the cluster continues operating.
+
+The service lives in the built `dstool` binary. Workers also need the `blobsan`
+executable built from `ydb/tools/blobsan`, with support for `--restore-canidates`.
+The analyzer is invoked as a black box: dstool does not reproduce ingress,
+GC-barrier, restorability or replica-layout analysis. No Python installation
+or shared database is required. The runtime uses Python's standard library and
+dstool's connection/configuration code; the terminal client uses Textual.
+Master, worker and console require POSIX; Linux is the deployment target.
+
+Every successful scan also produces a histogram of all observed blobs before
+candidate filtering, including complete layouts and GC metadata. Scans with
+insufficient candidate coverage still publish their histogram.
 
 ## Start
 
 ```bash
 dstool --token-file ~/.token blobsan-service master \
-    -l 22570 --db ~/w2x2_master_db/ --console-sock /tmp/w2x2.sock
+    -l 22570 --db ~/blobsan_master_db/ --console-sock /tmp/blobsan.sock
 
 # On each selected storage host:
 dstool --token-file ~/.token blobsan-service worker \
-    --master master-host:22570 --db ~/w2x2_worker_db/ --blobsan ~/blobsan
-
-# Observation without repair:
-dstool --token-file ~/.token blobsan-service worker \
-    --master master-host:22570 --db ~/w2x2_observer_db/ --blobsan ~/blobsan --scan-only
+    --master master-host:22570 --db ~/blobsan_worker_db/ --blobsan ~/blobsan
 ```
 
-For this command only, an omitted `-e` defaults to `localhost`. Each process
-uses its own endpoint and credentials. All workers must point to the **same
-cluster** as the master. Global `-e`, `--mon-port`, TLS and token options work
-as usual. `--viewer URL` overrides the HTTP Viewer URL; the master still uses
-its global endpoint for BSC discovery. Global token defaults/environment
-variables follow dstool conventions; `~/.token` is used only when supplied
-explicitly. Tokens are read at startup; restart the process to rotate them.
-`worker --blobsan PATH` defaults to `~/blobsan`. The master does not need it.
+For this command only, an omitted `-e` defaults to `localhost`. Every process
+uses its own endpoint and credentials. All workers must point to the same
+cluster as the master. Global `-e`, `--mon-port`, TLS and token options work
+as usual. `--viewer URL` overrides the HTTP Viewer URL; master discovery still
+uses the global endpoint for BSC. Tokens are read at startup, so restart to
+rotate credentials. `~/.token` is used only when explicitly supplied.
+`worker --blobsan PATH` defaults to `~/blobsan`; the master does not need it.
 
-Choose separate persistent directories for master and each worker. A file lock
-prevents two processes using the same directory. Run under your normal process
-supervisor for restart after host/process failure. Signals SIGINT/SIGTERM stop
-the service; an in-flight HTTP operation can run until its timeout.
+Choose separate persistent directories for the master and each worker. A file
+lock prevents two processes using the same directory. Run under a process
+supervisor for recovery after host/process failure. SIGINT/SIGTERM stop the
+service; an in-flight HTTP operation can run until its timeout.
 
 ## Deploy
 
@@ -59,245 +59,213 @@ for host in host1 host2; do scp ./apps/dstool/ydb-dstool "$host:dstool.new" && s
 The temporary file allows replacing a running executable. Restart services
 separately to use the new binary. Credentials are not copied.
 
-To copy both executables to worker hosts:
+To copy both executables to workers:
 
 ```bash
 for host in host1 host2; do scp ./apps/dstool/ydb-dstool "$host:dstool.new" && scp ./tools/blobsan/blobsan "$host:blobsan.new" && ssh "$host" 'chmod +x ~/dstool.new ~/blobsan.new && mv -f ~/dstool.new ~/dstool && mv -f ~/blobsan.new ~/blobsan'; done
 ```
 
-## Console
+Rebuild both binaries when changing analyzer protocols. The previous
+`--write2x2-candidates`, `worker --scan-only` and `worker --repair-delay` options
+are no longer used.
 
-The Unix socket is created with mode **0777**, as requested. Anyone who can
-access it can run console commands. No shell commands are executed by the
-console. Start the built-in terminal client on the master host:
+## Console and client
+
+The Unix socket is created with mode 0777. Anyone who can access it can run
+console commands. The console executes no shell commands. Start the terminal
+client on the master host:
 
 ```bash
-dstool blobsan-service client --console-sock /tmp/w2x2.sock
+dstool blobsan-service client --console-sock /tmp/blobsan.sock
 ```
 
 The client needs only the socket, without `--db`, credentials or cluster access.
-It displays pools, groups, layout histograms, workers and unresolved findings.
-Select a pool or group with **Enter** to open its histogram; Enter on a finding
-opens its group. Local layout `?` means incomplete coverage of that realm;
-`0` means all three VDisks were scanned and no local part was observed.
-`Local` retains group failrealm order. `Local3` sorts its three counts descending,
-with `?` last. `Local2` drops the last entry of Local3 (the smallest count or `?`).
-For example, `1+2+1` becomes Local3 `2+1+1` and Local2 `2+1`; `1+?+2` becomes
-Local3 `2+1+?` and also Local2 `2+1`. Failrealm permutations have equivalent
-replica distributions in mirror-3-dc.
+It displays pools, groups, layout histograms, workers and candidate BlobId lists.
+Enter on a pool or group opens its histogram. The **Candidates** tab shows
+Group, Category, BlobId, first/last observation ages, captured VDisk indexes and outdated/stale inventory markers.
+Select `inv1_candidate`, `inv2_candidate` or all categories. The default scope follows a
+selected group when available; uncheck **Selected group when available** to
+show all groups. **Previous** and **Next** browse pages of up to 1000 entries.
+An overlapping candidate occupies one entry in each category. Enter on a
+candidate opens its group histogram.
 
-The main histogram groups by Local2 and sorts Local2 ascending, with known
-counts before `?`. It shows blob counts, logical size, `phantom_like` and
-`write2x2_candidate`. Enter on a Local2 row opens its original Local, Local3,
-ingress/GC breakdown, replica size and missing metadata.
-Sizes choose B/KiB/MiB/GiB automatically.
-Ingress columns show metadata claims.
+The active view and statistics refresh every five seconds (`client --refresh
+SEC`). **F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses
+the command input, and **Ctrl+Q** exits. Buttons pause/resume assignment,
+schedule all groups and refresh inventory. Raw command responses appear in the
+Console tab; `quit` exits the client.
 
-The default GC filter includes `soft_with_keep` and `no_covering_barrier`.
-Choose either separately, any other GC state, or all states in the selector.
-Uncheck **Show phantom_like** to hide buckets explicitly marked `phantom_like`.
-Check **Show write2x2_candidate only** to include only buckets explicitly marked
-`write2x2_candidate`. Both checkboxes apply together with the GC selector before
-Local2 aggregation and detail counts; the collapsed GC summary also respects
-the checkboxes. By default, `phantom_like` is shown and candidates-only is off.
-Reports without annotations remain visible unless candidates-only is enabled.
-`hard_barrier`, `do_not_keep` and `soft_without_keep` have a collapsed GC summary.
-Annotation columns display `yes`, `no`, or `mixed (N/total)` when only N blobs
-in the Local2 row have the flag. `unknown` means the report lacks the annotation;
-old reports remain readable. The flags come from blobsan, including for observation-only
-workers; the client does not infer them from Local or ingress. Each refresh replaces
-the displayed histogram. Each group contributes only its latest successful scan.
-
-The active view and service stats refresh every 5 seconds (`client --refresh SEC`).
-**F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses the
-command input, and **Ctrl+Q** exits. Buttons pause/resume job assignment, schedule
-all groups for scanning, and refresh inventory. The command input accepts all
-commands below; responses appear in the Console tab. `quit` also exits the client.
-
-After connection loss the client retains the last displayed data, marks it stale,
-and reconnects on the next refresh. Requests have a 10-second deadline
-(`client --request-timeout SEC`). A failed interactive command is never retried
-automatically: its effect may already have been applied by the master.
+After connection loss the client retains displayed data, marks it stale and
+reconnects on the next refresh. Requests have a ten-second deadline (`client
+--request-timeout SEC`). Failed interactive commands are never retried
+automatically because their effect may already have been applied.
 
 | Command | Effect |
 |---|---|
-| `stats` | Discovery status, scans, candidate totals, unresolved findings, live workers, stale inventory and missing VDisks |
-| `groups` / `groups brief` | Per-group scan time, candidate count, coverage, repair response counts, owner, scheduling and errors; `brief` omits full reports and includes pool identity/generation |
-| `layouts GROUP` | Last successful histogram with captured/missing VDisks, stream errors, scan timestamps, generation and latest attempt error |
-| `pools [POOL]` | Histograms summed over the latest reports per group; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
+| `stats` | Discovery, scan/candidate totals, live workers, stale inventory and missing VDisks |
+| `groups` / `groups brief` | Group scan time, candidate count, coverage, owner, scheduling and errors; `brief` includes pool identity/generation and omits full reports |
+| `layouts GROUP` | Latest successful histogram, coverage, stream errors, timestamps, generation and latest attempt error |
+| `pools [POOL]` | Histograms summed over latest group reports; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
 | `workers` | Known workers and last contact timestamps |
-| `findings [GROUP]` | Up to 1000 unresolved candidates with last repair response |
+| `candidates CATEGORY [GROUP\|all] [OFFSET] [LIMIT]` | Candidate BlobIds; CATEGORY is `all`, `inv1_candidate` or `inv2_candidate`; default offset 0, limit 1000, maximum limit 1000 |
 | `pause` / `resume` | Stop/resume assigning new jobs; running jobs finish |
 | `scan [GROUP\|all]` | Make a group/all groups eligible for scanning now |
-| `interval SECONDS` | Change the clean-group rescan interval |
-| `retry SECONDS` | Change the delay after candidates or scan errors |
-| `refresh` | Refresh group topology now |
+| `interval SECONDS` | Set the clean-group rescan interval |
+| `retry SECONDS` | Set the delay after candidates or scan errors |
+| `refresh` | Refresh group topology |
 | `help` / `quit` | Show commands / disconnect |
 
+For example, `candidates inv1_candidate 2147483649 0 100` returns the first 100 `inv1_candidate`
+entries for group 2147483649. Its JSON object contains `category`, `group`
+(null for all groups), `offset`, `limit`, `total` and `rows`. Each row has `gid`,
+`category`, `blob`, `first_seen`, `last_seen`, `coverage`, `generation`,
+`outdated` and `inventory_stale`. Raw timestamps are
+Unix timestamps; the dashboard displays ages. Histograms show aggregate
+counts, while this command and the Candidates tab expose individual BlobIds.
+
 Intervals and pause state persist in SQLite. `--interval` (default 3600 seconds)
-and `--retry` (60) initialize a new database; subsequently use the console.
-Changed intervals apply when scheduling the next completed job; `scan all`
-also resets previously scheduled due times. The socket retains its plain-text
-request/response protocol for other clients. Times in raw console rows are Unix
-timestamps; dashboard tables display ages.
+and `--retry` (60) initialize a new database; use the console afterward. Changed
+intervals apply when scheduling the next completed job; `scan all` also resets
+previously scheduled due times. The socket retains its plain-text
+request/response framing for other clients.
 
 ## Scheduling and persistence
 
-One worker processes one group at a time. The master avoids concurrent jobs
-sharing storage nodes. This is intentionally conservative; tune concurrency
-after measuring real groups. All VDisks of one group can stream concurrently.
-Repair requests are sequential; `worker --repair-delay SECONDS` adds spacing.
+One worker scans one group at a time. The master avoids concurrent jobs sharing
+storage nodes. All VDisks of one group can stream concurrently. Master SQLite
+stores topology, leases, schedules, per-category candidate lists and latest
+reports. Workers persist identity and unacknowledged results locally.
 
-Master SQLite stores topology, leases, schedules, findings and the latest
-summary per group. Workers persist their identity and unacknowledged report in
-their local directory. Compressed snapshot files for the last job remain in
-`DB/scan` and are replaced by the next job. The assembled input is `snapshot`;
-the analyzer's full stderr is `blobsan.err`. `manifest.json` records the group
-and successfully completed streams, including empty streams; `report.json`
-contains the analyzer histogram. Resource usage depends on group
-size, the external analyzer and retained findings.
+Snapshot files for the last job remain in `DB/scan` and are replaced by the
+next job. `snapshot` is the assembled input, `blobsan.err` is analyzer stderr,
+`manifest.json` records the group and successfully completed streams, including
+empty streams, and `report.json` contains the histogram. Resource usage depends
+on group size, the external analyzer and candidate lists.
 
 Jobs have renewable leases (`master --lease`, default 120 seconds). Failed
-workers' jobs become available after lease expiry. Claim retries return the
-same assignment; duplicate reports are acknowledged without applying twice;
-expired/reassigned reports are rejected. Worker heartbeat interval defaults to
-20 seconds and is capped at one third of the granted lease. Loss of contact
-stops new repair requests; an already issued request cannot be revoked in
-`ydbd`. The master itself is a single coordinator, without automatic failover.
+workers' jobs become available after expiry. Claim retries return the same
+assignment; duplicate results are acknowledged without applying twice;
+expired/reassigned results are rejected. Worker heartbeat interval defaults
+to 20 seconds and is capped at one third of the granted lease. Loss of contact
+cancels the scan. The master is a single coordinator without automatic failover.
 
-`master --refresh` controls topology discovery (300 seconds). Stale inventory
-older than twice this interval is not assigned. Generation changes invalidate
-old jobs. Workers verify group generation before scanning, before repairs and
-after repairs. Each check makes a fresh Viewer request limited to the group's
-storage nodes (`node_id`), with the response filtered by `GroupID`. No global
-whiteboard query is used for these checks. The configured geometry must be
-3 realms x 3 domains x 1 VDisk.
-Static groups are discovered through Viewer; an unavailable static VDisk may
-be absent from that inventory and is reported as missing. A static inventory
-with at least one VDisk is sufficient for an observation. Dynamic virtual/blob-depot groups are excluded.
+`master --refresh` controls topology discovery (300 seconds). Inventory older
+than twice this interval is not assigned. Generation changes invalidate old
+jobs. Workers verify group generation before and after scanning with fresh
+Viewer requests limited to the group's storage nodes (`node_id`) and filtered
+by `GroupID`. Geometry must be 3 realms x 3 domains x 1 VDisk.
 
-The API listens on all interfaces by default (`--bind` changes this). Use it on
-a trusted network. Optional `--secret-file` on master and workers enables
-shared-secret authentication. The built-in master API is HTTP, not TLS; it
-should not be exposed to an untrusted network. The cluster token is never sent
-to the master by a worker.
+Static groups are discovered through Viewer; unavailable VDisks may be absent
+from inventory and are reported missing. At least one VDisk permits an
+observation. Dynamic virtual/blob-depot groups are excluded.
 
-## What a successful pass means
+The API listens on all interfaces by default (`--bind` changes this). Optional
+`--secret-file` on master/workers enables shared-secret authentication. The
+master API is HTTP, not TLS; use a trusted network. Workers never send cluster
+tokens to the master.
 
-The worker downloads `vdisk_stream` responses until the endpoint returns an
-empty response. HTTP failures and explicit `ERROR` responses discard that
-VDisk's stream; the next attempt creates a new session. A session request is
-never retried because the server may already have advanced its cursor. The
-worker adds the same group/index/length framing as `dstool group take-snapshot`,
-without decoding the metadata payload.
+## Scan and candidate semantics
 
-An observation requires at least one complete VDisk stream. Partial streams
-are discarded; missing indexes and errors are recorded. With no complete
-streams, the attempt fails and preserves the previous report. Snapshots across
-VDisk are not atomic. Empty initial streams are valid empty indexes and are
-explicitly identified by the manifest. Candidate processing still requires
-three complete VDisk streams in each of at least two realms.
+Workers download each `vdisk_stream` until it returns an empty response.
+HTTP failures and explicit `ERROR` responses discard that VDisk's stream.
+Requests are never retried within a stream because its cursor may already have
+advanced. Workers add the same group/index/length framing as `dstool group
+take-snapshot`, without decoding payloads.
 
-The assembled snapshot is passed as stdin to
-`blobsan --write2x2-candidates --scan-manifest manifest.json --scan-report report.json mirror-3-dc`.
-Blobsan emits its usual candidate diagnostics; the worker decides whether to
-act on them. Stdout goes
-to `/dev/null`, as in the original scripts (this also disables verbose output
-in blobsan). Stderr is saved and only `GroupId# ... BlobId# ...` lines are parsed.
-The supplied executable is the sole authority on candidate selection and
-snapshot payload validation. The service validates the JSON report's schema,
-coverage and histogram totals. A nonzero exit, timeout, or malformed candidate
-line fails the pass. The process is terminated on cancellation or lease loss.
-The service itself does not check ingress, GC barriers, or replication layout
-inside the snapshot. Transport completion plus analyzer success is not an
-independent proof of complete or consistent metadata. The analyzer must support
-`--write2x2-candidates`; the ordinary diagnostic mode selects different blobs.
+At least one complete stream is required for an observation. No complete
+streams means failure and preservation of the previous report. Empty streams
+are valid empty indexes identified explicitly by the manifest. Captures across
+VDisks are not atomic. Candidate evaluation requires three complete VDisk
+streams in each of at least two realms.
 
-`request_ok` means `blob_range` returned the requested blob with `Status=OK`;
-`absent` means it returned an empty list. Neither removes a finding. A later
-scan removes each finding it no longer observes only if the VDisk coverage
-matches the scan that last observed that finding, or includes all nine VDisks.
-Coverage is persisted per finding: repeated scans of a different set of VDisks
-cannot close an older finding. Groups with unresolved findings use
-the retry interval even when the latest scan has no candidates. The report's
-`unresolved` count includes findings retained from earlier scans.
-`disappeared` means no longer a candidate, not proof that a blob was copied
-rather than garbage-collected.
-`new_total` includes initially discovered and subsequently reappearing candidates.
-Scan errors preserve existing findings. Repair failures remain visible and are
-retried after another scan; there is no permanent processed-blob blacklist.
+The assembled snapshot is stdin to:
 
-No direct writes of blob contents are performed by the service: actual repair
-and GC/existence decisions remain in DSProxy through `mustRestoreFirst`.
+```bash
+blobsan --restore-canidates --scan-manifest manifest.json --scan-report report.json mirror-3-dc
+```
+
+One invocation supplies both categories. Stdout goes to `/dev/null`, which also
+disables verbose analyzer output. Stderr is retained and classified candidate
+lines are parsed. The analyzer alone decides candidate membership. The service
+validates report schema, coverage and histogram totals. A nonzero exit, timeout
+or malformed candidate line fails the pass. Cancellation or lease loss
+terminates the analyzer. Transport completion plus analyzer success is not an
+independent proof of complete or consistent metadata.
+
+The master tracks each category independently. Failed scans preserve existing
+lists. Insufficient-coverage scans publish observations without clearing
+previous candidates. A later evaluated scan removes a previous candidate only
+when it covers the same VDisks as that candidate's last observation or all nine
+VDisks. A disappearing candidate may have been garbage-collected; disappearance
+does not prove replication. Groups with candidates or missing VDisks use the
+retry interval. A candidate can leave `inv1_candidate` while remaining in
+`inv2_candidate`. Retained lists can reflect different observation times and
+coverage; their membership need not preserve that subset relation between scans.
 
 ## Layout reports
 
-`layouts GROUP` includes `scan_report` version 1, with `group_id`,
+`layouts GROUP` includes `scan_report` version 1 with `group_id`,
 `completed_vdisks`, `buckets` and `totals`. Each bucket has `local`, `ingress`,
 `gc` and four counters:
 
 | Counter | Meaning |
 |---|---|
-| `blobs` | Unique BlobIds within the group, after merging duplicate index records |
-| `logical_bytes` | Sum of BlobSize once per blob |
-| `observed_replica_bytes` | Sum of BlobSize for every observed correctly placed local part |
-| `missing_metadata_blobs` | Blobs with no index record on at least one successfully captured VDisk |
+| `blobs` | Unique BlobIds after merging duplicate index records |
+| `logical_bytes` | BlobSize once per blob |
+| `observed_replica_bytes` | BlobSize per observed correctly placed local part |
+| `missing_metadata_blobs` | Blobs with no index record on at least one captured VDisk |
 
-New analyzers also supply boolean `phantom_like` and `write2x2_candidate` per
-bucket. Buckets with different annotations remain separate in the report and
-pool aggregation, even when Local, ingress and GC match. `phantom_like` is the
-analyzer's `seenDisks != blob.Info.Nodes` condition: at least one captured index
-has no metadata record for this BlobId. `write2x2_candidate` uses the same GC,
-local completeness, metadata, restorability and failure-model conditions as the
-`--write2x2-candidates` output. It is included in the report regardless of whether
-the worker issues repair requests. Without `--write2x2-candidates`
-this field is null, since that mode accepts different GC barriers. Missing/null
-annotations in older reports mean unknown, rather than false.
+Annotations are `phantom_like`, `inv1_candidate` and `inv2_candidate`. Buckets with
+different annotations remain separate even if Local, ingress and GC match.
+`phantom_like` means a captured index lacks metadata for this BlobId.
+Both candidate annotations include the analyzer's GC, metadata, restorability
+and failure-model checks. `inv1_candidate` tests whether the minimum local replica count
+among fully captured datacenters is below one; `inv2_candidate` tests below two.
+Unknown (`?`) realms are ignored. With no known realm, both flags are false.
+Older reports
+without new annotations display unknown. The legacy `write2x2_candidate` flag
+is not treated as either new category.
 
-Both layout strings use **group failrealm order** (0, 1, 2), rather than the
-blob-dependent part/subgroup order. `local=1+1+?` means one copy in each of the
-first two realms and incomplete observation of the third. A realm is `?` when
-any of its three VDisks is missing, regardless of copies observed on its other
-VDisk(s). `0` means all three indexes were captured and no local part was found.
-`ingress` counts correctly placed parts known from merged ingress, including
-claims about unavailable VDisks. It is metadata knowledge, not confirmation of
-local data. Wrong-realm parts are not counted as replicas.
+Local and ingress strings retain group failrealm order. `local=1+1+?` means
+one copy in each of the first two realms and incomplete coverage of the third.
+A realm is `?` when any of its three VDisks is missing. `0` means every index
+was captured but no correctly placed local part was observed. Ingress reflects
+merged metadata claims, including unavailable VDisks, rather than confirmation
+of local data. Misplaced parts do not count as replicas.
 
-Local counters are collected before applying GC discards to the local layout.
-GC states follow the existing analyzer's accepted barriers and merged flags,
-with the following precedence:
+The histogram groups by Local2. Local3 sorts the three local counts descending,
+with `?` last; Local2 drops its last count. For example, `1+2+1` and `1+?+2`
+both yield Local2 `2+1`. Enter opens original Local, Local3, ingress and GC
+breakdowns, replica size and missing metadata. Sizes use B/KiB/MiB/GiB as needed.
+
+The default GC filter selects `soft_with_keep` and `no_covering_barrier`.
+The selector also offers individual states and all states. **Show phantom_like**
+controls phantom buckets. **Show inv1_candidate only** and **Show inv2_candidate only**
+select the corresponding explicit annotations; enabling both selects their
+intersection. Filters apply before Local2 aggregation and to the collapsed GC
+summary. Annotation cells show `yes`, `no`, `mixed (N/total)` or `unknown`.
+
+Local counters precede GC discards. GC states have this precedence:
 
 | `gc` | Condition |
 |---|---|
-| `hard_barrier` | A covering hard barrier was observed |
-| `do_not_keep` | DoNotKeep is set |
-| `soft_without_keep` | A covering soft barrier was observed, without Keep |
-| `soft_with_keep` | A covering soft barrier was observed, with Keep |
-| `no_covering_barrier` | No accepted covering barrier was observed on captured indexes |
+| `hard_barrier` | An observed covering hard barrier |
+| `do_not_keep` | DoNotKeep set |
+| `soft_without_keep` | An observed covering soft barrier without Keep |
+| `soft_with_keep` | An observed covering soft barrier with Keep |
+| `no_covering_barrier` | No accepted covering barrier |
 
-These labels describe the observed metadata, not proof of current physical
-existence or completed garbage collection. In write2x2 mode the analyzer accepts
-barriers without quorum. Blobs excluded by candidate filters, including missing
-metadata and complete layouts, remain in the histogram. Blobs absent from every
-captured index cannot be inventoried; partial reports describe observed bytes.
+These labels describe metadata rather than proof of current existence or
+completed garbage collection. Candidate mode accepts barriers without quorum.
+Filtered blobs remain in histograms. Blobs absent from every captured index
+cannot be inventoried.
 
-The master persists the latest successful report for each group independently
-of its latest attempt. Failure preserves that report and is shown as
-`latest_error`. Observation-only and insufficient-coverage scans do not close
-previous recovery findings or report zero recovery candidates.
-
-`pools` sums each group's latest histogram once. It reports `full_groups`,
-`partial_groups`, `never_scanned_groups`, `outdated_groups`,
-`stale_inventory_groups` and `failed_groups`, plus oldest/newest scan times.
-Reports whose group generation or topology fingerprint has changed are excluded,
-as are groups whose inventory is older than twice the discovery refresh interval.
-Other old reports remain visible with their timestamps, including after a failed
-attempt. Pool identity is BoxId/StoragePoolId, so identical pool names in
-different boxes stay separate. Failrealm positions are retained in pool buckets;
-they refer to group topology, not a global datacenter name.
-Cached dynamic inventory without pool IDs from older masters is kept separate
-per group under `unknown:GROUP` until topology discovery refreshes it.
-
-Rebuild both `dstool` and `blobsan` when upgrading to layout reports. Existing
-master databases gain the report table automatically; groups without reports
-are listed as never scanned until a reporting worker visits them.
+Each group's latest successful report is retained independently of its latest
+attempt. Failure is shown as `latest_error`. `pools` sums the latest histogram
+once per group and reports full/partial, never scanned, outdated, stale and
+failed group counts plus scan ages. Reports with changed generation/topology
+or stale inventory are excluded. Other old reports remain visible with their
+timestamps. Pool identity is BoxId/StoragePoolId, keeping duplicate names in
+different boxes separate. Cached inventory without pool IDs is isolated per
+group under `unknown:GROUP` until rediscovery. Failrealm positions refer to each
+group's topology, rather than global datacenter names.

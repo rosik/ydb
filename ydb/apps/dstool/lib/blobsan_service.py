@@ -1,7 +1,6 @@
 """Coordinator and worker runtime for blobsan-service (standard library)."""
 
 import argparse
-import collections
 import concurrent.futures
 import hashlib
 import hmac
@@ -34,7 +33,8 @@ from ydb.apps.dstool.lib import common, write2x2_report
 LOG = logging.getLogger('blobsan-service')
 STOP = threading.Event()
 MAX_BODY = 128 * 1024 * 1024
-CANDIDATE = re.compile(r'GroupId#\s+(\d+)\s+BlobId#\s+(\[(?:\d+:){6}\d+\])')
+CANDIDATE = re.compile(r'^GroupId#\s+(\d+)\s+BlobId#\s+(\[(?:\d+:){6}0\])(?:\s+(.*))?$')
+CATEGORIES = ('inv1_candidate', 'inv2_candidate')
 
 
 def encode(value):
@@ -191,6 +191,12 @@ class Master:
             CREATE TABLE IF NOT EXISTS findings(
                 gid INTEGER, blob TEXT, first_seen REAL, last_seen REAL, active INTEGER,
                 status TEXT, coverage TEXT NOT NULL, PRIMARY KEY(gid,blob));
+            CREATE TABLE IF NOT EXISTS restore_candidates(
+                gid INTEGER, category TEXT, blob TEXT, first_seen REAL, last_seen REAL, active INTEGER,
+                coverage TEXT NOT NULL, generation INTEGER, fingerprint TEXT,
+                PRIMARY KEY(gid,category,blob));
+            CREATE INDEX IF NOT EXISTS restore_candidates_active
+                ON restore_candidates(active,category,gid,blob);
             CREATE TABLE IF NOT EXISTS scan_reports(
                 gid INTEGER PRIMARY KEY, generation INTEGER, fingerprint TEXT,
                 started REAL, finished REAL, result TEXT);
@@ -270,12 +276,22 @@ class Master:
             if action != '/result':
                 raise ValueError('Unknown operation')
             result = body['result']
+            # A persisted result from an older worker must be acknowledged so
+            # pending.json can drain, but its old category cannot be relabeled.
+            if 'candidates' not in result and 'findings' in result and not result.get('error'):
+                result = dict(error='Legacy candidate result; rescan with --restore-canidates')
             error = result.get('error')
             if not error:
-                findings = result['findings']
-                if not isinstance(findings, dict) or any(
-                        not re.fullmatch(r'\[(?:\d+:){6}0\]', b) or not isinstance(s, str) for b, s in findings.items()):
-                    raise ValueError('Invalid findings')
+                candidates = result['candidates']
+                if not isinstance(candidates, dict) or set(candidates) != set(CATEGORIES):
+                    raise ValueError('Invalid candidate categories')
+                for blobs in candidates.values():
+                    if not isinstance(blobs, list) or any(
+                            not isinstance(blob, str) or not re.fullmatch(r'\[(?:\d+:){6}0\]', blob) for blob in blobs
+                    ) or len(set(blobs)) != len(blobs):
+                        raise ValueError('Invalid candidate list')
+                if not set(candidates['inv1_candidate']).issubset(candidates['inv2_candidate']):
+                    raise ValueError('inv1_candidate must be a subset of inv2_candidate')
                 completed = result['completed_vdisks']
                 if not isinstance(completed, list) or any(type(i) is not int or i not in range(9) for i in completed) or len(set(completed)) != len(completed):
                     raise ValueError('Invalid coverage')
@@ -285,39 +301,47 @@ class Master:
                     started, finished = result['started_at'], result['finished_at']
                     if any(type(t) not in (int, float) or not math.isfinite(t) for t in (started, finished)) or started > finished:
                         raise ValueError('Invalid scan timestamps')
-                findings_complete = result.get('findings_complete', True)
-                if type(findings_complete) is not bool or (not findings_complete and (report is None or findings)):
+                candidates_complete = result['candidates_complete']
+                if type(candidates_complete) is not bool or (not candidates_complete and (
+                        report is None or any(candidates.values()))):
                     raise ValueError('Invalid candidate scan status')
-                if not completed or (findings_complete and not has_two_complete_realms(completed)):
+                if not completed or (candidates_complete and not has_two_complete_realms(completed)):
                     raise ValueError('Incomplete scan')
-                previous = {r['blob']: r['coverage'] for r in self.db.execute(
-                    'SELECT blob,coverage FROM findings WHERE gid=? AND active=1', (gid,))}
-                resolved = {blob for blob, coverage in previous.items() if findings_complete and blob not in findings and
+                previous = {(r['category'], r['blob']): r['coverage'] for r in self.db.execute(
+                    'SELECT category,blob,coverage FROM restore_candidates WHERE gid=? AND active=1', (gid,))}
+                current = {(category, blob) for category, blobs in candidates.items() for blob in blobs}
+                resolved = {key for key, coverage in previous.items() if candidates_complete and key not in current and
                             (len(completed) == 9 or set(completed) == set(json.loads(coverage)))}
-                self.db.executemany('UPDATE findings SET active=0 WHERE gid=? AND blob=?',
-                                    ((gid, blob) for blob in resolved))
+                self.db.executemany('UPDATE restore_candidates SET active=0 WHERE gid=? AND category=? AND blob=?',
+                                    ((gid, category, blob) for category, blob in resolved))
                 coverage = json.dumps(sorted(completed))
-                new = 0
-                for blob, status in findings.items():
-                    new += blob not in previous
-                    self.db.execute('''INSERT INTO findings(gid,blob,first_seen,last_seen,active,status,coverage)
-                        VALUES(?,?,?,?,1,?,?) ON CONFLICT(gid,blob) DO UPDATE SET
-                        last_seen=excluded.last_seen,active=1,status=excluded.status,coverage=excluded.coverage''',
-                                    (gid, blob, now, now, status, coverage))
-                unresolved = len((previous.keys() - resolved) | findings.keys())
-                result = {k: v for k, v in result.items() if k != 'findings'}
-                result.update(candidates=len(findings) if findings_complete else None, new=new,
-                              disappeared=len(resolved), unresolved=unresolved)
+                layout = json.loads(row['layout'])
+                self.db.executemany(
+                    '''INSERT INTO restore_candidates
+                    (gid,category,blob,first_seen,last_seen,active,coverage,generation,fingerprint)
+                    VALUES(?,?,?,?,?,1,?,?,?) ON CONFLICT(gid,category,blob) DO UPDATE SET
+                    last_seen=excluded.last_seen,active=1,coverage=excluded.coverage,
+                    generation=excluded.generation,fingerprint=excluded.fingerprint''',
+                    ((gid, category, blob, now, now, coverage, layout['generation'], layout['fingerprint'])
+                     for category, blob in current))
+                previous_blobs = {blob for _, blob in previous}
+                current_blobs = {blob for _, blob in current}
+                unresolved_blobs = {blob for _, blob in (previous.keys() - resolved) | current}
+                new = len(current_blobs - previous_blobs)
+                result = {k: v for k, v in result.items() if k != 'candidates'}
+                result.update(candidates=len(current_blobs) if candidates_complete else None,
+                              candidate_counts={category: len(candidates[category]) for category in CATEGORIES}
+                              if candidates_complete else None, new=new,
+                              disappeared=len(previous_blobs - unresolved_blobs), unresolved=len(unresolved_blobs))
                 self.db.execute('''UPDATE groups SET last_scan=?,last_count=?,scans=scans+1,
                     new_total=new_total+? WHERE id=?''', (now, result['candidates'], new, gid))
                 if report is not None:
-                    layout = json.loads(row['layout'])
                     self.db.execute('''INSERT OR REPLACE INTO scan_reports
                         VALUES(?,?,?,?,?,?)''', (gid, layout['generation'], layout['fingerprint'],
                                                  started, finished, json.dumps(result)))
-                delay = self.setting('retry' if unresolved or len(completed) < 9 else 'interval')
+                delay = self.setting('retry' if unresolved_blobs or len(completed) < 9 else 'interval')
                 if new:
-                    LOG.warning('Group %s: %d new/reappeared candidates, %d total', gid, new, len(findings))
+                    LOG.warning('Group %s: %d new/reappeared candidates, %d total', gid, new, len(current_blobs))
             else:
                 delay = self.setting('retry')
                 LOG.warning('Group %s failed: %s', gid, error)
@@ -381,6 +405,38 @@ class Master:
             results.append(pool)
         return results
 
+    def candidates(self, words):
+        category = words[0] if words else 'all'
+        if category not in (*CATEGORIES, 'all') or len(words) > 4:
+            raise ValueError('Use candidates CATEGORY [GROUP|all] [OFFSET] [LIMIT]')
+        gid = None if len(words) < 2 or words[1] == 'all' else int(words[1])
+        offset = int(words[2]) if len(words) > 2 else 0
+        limit = int(words[3]) if len(words) > 3 else 1000
+        if offset < 0 or not 1 <= limit <= 1000:
+            raise ValueError('Offset must be nonnegative and limit must be in [1, 1000]')
+        conditions, values = ['c.active=1'], []
+        if category != 'all':
+            conditions.append('c.category=?')
+            values.append(category)
+        if gid is not None:
+            conditions.append('c.gid=?')
+            values.append(gid)
+        where = ' AND '.join(conditions)
+        total = self.db.execute('SELECT count(*) FROM restore_candidates c WHERE ' + where, values).fetchone()[0]
+        query = '''SELECT c.gid,c.category,c.blob,c.first_seen,c.last_seen,c.coverage,
+            c.generation,c.fingerprint,g.layout,g.seen FROM restore_candidates c
+            JOIN groups g ON g.id=c.gid WHERE ''' + where + ' ORDER BY c.gid,c.category,c.blob LIMIT ? OFFSET ?'
+        rows = self.db.execute(query, (*values, limit, offset))
+        items = []
+        for row in rows:
+            item = dict(row)
+            layout = json.loads(item.pop('layout'))
+            item['coverage'] = json.loads(item['coverage'])
+            item['outdated'] = item.pop('fingerprint') != layout['fingerprint'] or item['generation'] != layout['generation']
+            item['inventory_stale'] = item.pop('seen') < time.time() - self.args.refresh * 2
+            items.append(item)
+        return dict(category=category, group=gid, offset=offset, limit=limit, total=total, rows=items)
+
     def console(self, command):
         words = shlex.split(command)
         if not words:
@@ -399,6 +455,8 @@ class Master:
                     self.db.execute('UPDATE groups SET due=0 WHERE id=?', (int(words[1]),))
             elif op == 'refresh':
                 self.refresh.set()
+            elif op == 'candidates':
+                return json.dumps(self.candidates(words[1:]))
             elif op == 'layouts':
                 return json.dumps(self.layouts(int(words[1]), time.time()), indent=2)
             elif op == 'pools':
@@ -415,7 +473,11 @@ class Master:
                     'SELECT count(*) FROM workers WHERE seen>?', (now - self.args.lease,)).fetchone()[0]
                 stats['stale_inventory_groups'] = self.db.execute(
                     'SELECT count(*) FROM groups WHERE seen<?', (now - self.args.refresh * 2,)).fetchone()[0]
-                stats['unresolved_findings'] = self.db.execute('SELECT count(*) FROM findings WHERE active=1').fetchone()[0]
+                stats['unresolved_candidates'] = self.db.execute(
+                    'SELECT count(DISTINCT gid || ":" || blob) FROM restore_candidates WHERE active=1').fetchone()[0]
+                for category, key in zip(CATEGORIES, ('inv1_candidates', 'inv2_candidates')):
+                    stats[key] = self.db.execute(
+                        'SELECT count(*) FROM restore_candidates WHERE active=1 AND category=?', (category,)).fetchone()[0]
                 stats['scans_with_missing_vdisks'] = sum(
                     bool(json.loads(r[0]).get('missing_vdisks'))
                     for r in self.db.execute('SELECT last_result FROM groups WHERE last_result IS NOT NULL'))
@@ -444,7 +506,9 @@ class Master:
                     query, values = ('SELECT * FROM findings WHERE active=1 LIMIT 1000', ())
                 return '\n'.join(json.dumps(dict(r)) for r in self.db.execute(query, values)) or '(empty)'
             elif op == 'help':
-                return 'stats | groups [brief] | layouts GROUP | pools [POOL] | workers | findings [GROUP] (max 1000) | pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit'
+                return ('stats | groups [brief] | layouts GROUP | pools [POOL] | workers | '
+                        'candidates CATEGORY [GROUP|all] [OFFSET] [LIMIT] (max 1000/page) | '
+                        'pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit')
             else:
                 raise ValueError('Unknown command; use help')
         return 'OK'
@@ -597,14 +661,14 @@ def scan(args, job, directory, cancel):
 
 
 def run_blobsan(args, gid, directory, cancel):
-    """The supplied executable alone decides which blobs need repair."""
+    """The supplied executable alone classifies restoration candidates."""
     check_running(cancel)
     report = directory / 'blobsan.err'
     manifest_path = (directory / 'manifest.json').resolve()
     manifest = json.loads(manifest_path.read_text())
     statistics_path = (directory / 'report.json').resolve()
     statistics_path.unlink(missing_ok=True)
-    command = [args.blobsan, '--write2x2-candidates', '--scan-manifest', str(manifest_path),
+    command = [args.blobsan, '--restore-canidates', '--scan-manifest', str(manifest_path),
                '--scan-report', str(statistics_path)]
     command.append('mirror-3-dc')
     with (directory / 'snapshot').open('rb') as inp, report.open('wb') as err:
@@ -629,15 +693,19 @@ def run_blobsan(args, gid, directory, cancel):
                     process.wait()
     check_running(cancel)
     statistics = write2x2_report.validate(json.loads(statistics_path.read_text()), gid, manifest['completed_vdisks'])
-    candidates = set()
+    candidates = {category: set() for category in CATEGORIES}
     with report.open(errors='replace') as inp:
         for line in inp:
             if 'GroupId#' not in line:
                 continue
-            match = CANDIDATE.search(line)
-            if not match or int(match[1]) != gid or match[2].split(':')[-1] != '0]':
+            match = CANDIDATE.fullmatch(line.strip())
+            flags = set(match[3].split()) if match and match[3] else set()
+            categories = flags.intersection(CATEGORIES)
+            if not match or int(match[1]) != gid or not categories or flags - {*CATEGORIES, 'FULL'} or (
+                    'inv1_candidate' in categories and 'inv2_candidate' not in categories):
                 raise ValueError('Unrecognized blobsan candidate: ' + line[:200])
-            candidates.add(match[2])
+            for category in categories:
+                candidates[category].add(match[2])
     return candidates, statistics
 
 
@@ -656,38 +724,6 @@ def validate_layout(args, job):
         raise ValueError('Group generation changed or cannot be verified')
     if group.get('ErasureSpecies') != 'mirror-3-dc':
         raise ValueError('Group erasure changed')
-
-
-def repair(args, job, candidates, cancel):
-    layout, base = job['layout'], viewer_url(args)
-    if not candidates:
-        return {}
-    tenants = ydb_http(args, base + '/viewer/json/tenantinfo').get('TenantInfo', [])
-    systems = ydb_http(args, base + '/viewer/json/sysinfo').get('SystemStateInfo', [])
-    pool = layout.get('pool') or 'static'
-    tenant = pool.rpartition(':')[0] if ':' in pool else None
-    nodes = {int(n) for t in tenants if t['Name'] == tenant for n in t.get('NodeIds', [])}
-    nodes.update(int(s['NodeId']) for s in systems if tenant and tenant in s.get('Tenants', []))
-    if not nodes:
-        nodes = {int(s['NodeId']) for s in systems if not s.get('Tenants')}
-    if not nodes:
-        raise ValueError('No proxy nodes available for group')
-    nodes = sorted(nodes)
-    results = {}
-    for i, blob in enumerate(sorted(candidates)):
-        check_running(cancel)
-        params = dict(groupId=layout['id'], tabletId=blob[1:].split(':')[0],
-                      mustRestoreFirst=1, json=1, **{'from': blob, 'to': blob})
-        try:
-            response = ydb_http(args, base + '/node/%d/blob_range?' % nodes[i % len(nodes)] + urllib.parse.urlencode(params))
-            if response.get('Status') != 'OK' or response.get('Blobs') not in ([], [blob]):
-                raise ValueError('Unexpected response: ' + str(response)[:300])
-            results[blob] = 'request_ok' if response['Blobs'] else 'absent'
-        except Exception as exc:
-            results[blob] = 'failed: ' + str(exc)[:300]
-        if args.repair_delay:
-            cancel.wait(args.repair_delay)
-    return results
 
 
 def work(args, directory):
@@ -730,7 +766,7 @@ def work(args, directory):
                             return
                         cancel.deadline = start + lease_seconds
                     except Exception:
-                        # No new writes while ownership cannot be confirmed.
+                        # Stop scanning while ownership cannot be confirmed.
                         cancel.set()
                         return
 
@@ -745,20 +781,16 @@ def work(args, directory):
                 check_running(cancel)
                 validate_layout(args, job)
                 candidates, coverage = scan(args, job, scratch, cancel)
-                validate_layout(args, job)
-                findings_complete = not args.scan_only and has_two_complete_realms(coverage['completed_vdisks'])
-                try:
-                    findings = repair(args, job, candidates, cancel) if findings_complete else {}
-                except Exception as exc:
-                    check_running(cancel)
-                    findings = {blob: 'failed: ' + str(exc)[:300] for blob in candidates}
                 check_running(cancel)
                 validate_layout(args, job)
-                result = dict(findings=findings, findings_complete=findings_complete, **coverage)
-                result['repairs'] = dict(collections.Counter(s.split(':')[0] for s in findings.values()))
-                LOG.info('Group %s: %d observed blobs, candidates %s, repairs %s', gid,
-                         coverage['scan_report']['totals']['blobs'], len(candidates) if findings_complete else 'not evaluated',
-                         result['repairs'])
+                candidates_complete = has_two_complete_realms(coverage['completed_vdisks'])
+                result = dict(candidates={category: sorted(candidates[category]) if candidates_complete else []
+                                          for category in CATEGORIES},
+                              candidates_complete=candidates_complete, **coverage)
+                LOG.info('Group %s: %d observed blobs, candidate counts %s', gid,
+                         coverage['scan_report']['totals']['blobs'],
+                         {category: len(blobs) for category, blobs in result['candidates'].items()}
+                         if candidates_complete else 'not evaluated')
             except Exception as exc:
                 log_failure('Group %s failed', exc, gid)
                 result = dict(getattr(exc, 'coverage', {}), error=str(exc))

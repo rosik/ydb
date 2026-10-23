@@ -42,11 +42,13 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
         job = self.master.rpc('/claim', dict(worker='worker-1', info='host1'))['job']
         bucket = dict(local='1+1+?', ingress='1+1+1', gc='no_covering_barrier', blobs=4,
                       logical_bytes=4096, observed_replica_bytes=8192, missing_metadata_blobs=0,
-                      phantom_like=False, write2x2_candidate=True)
+                      phantom_like=False, inv1_candidate=False, inv2_candidate=True)
         report = dict(version=1, group_id=self.gid, completed_vdisks=list(range(6)),
                       buckets=[bucket], totals=write2x2_report.totals([bucket]))
         self.master.rpc('/result', dict(worker='worker-1', group=self.gid, token=job['token'], result=dict(
-            findings={'[42:7:258:3:5:4096:0]': 'request_ok'}, completed_vdisks=list(range(6)),
+            candidates={'inv1_candidate': [],
+                        'inv2_candidate': ['[42:7:258:3:5:4096:0]']},
+            candidates_complete=True, completed_vdisks=list(range(6)),
             missing_vdisks=[6, 7, 8], scan_report=report, started_at=now - 2, finished_at=now - 1)))
         self.server = svc.UnixServer(self.path, svc.Console)
         self.server.master = self.master
@@ -85,7 +87,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
         report = dict(version=1, group_id=gid, completed_vdisks=list(completed),
                       buckets=buckets, totals=write2x2_report.totals(buckets))
         self.master.rpc('/result', dict(worker='worker-1', group=gid, token=job['token'], result=dict(
-            findings={}, findings_complete=False, completed_vdisks=list(completed),
+            candidates={'inv1_candidate': [], 'inv2_candidate': []}, candidates_complete=False, completed_vdisks=list(completed),
             missing_vdisks=sorted(set(range(9)) - set(completed)),
             scan_report=report, started_at=now - 1, finished_at=now)))
 
@@ -106,7 +108,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await self.settle(app, pilot)
             self.assertEqual(app.detail_target, ('pool', '1:7'))
             layout = app.query_one('#layout-table', DataTable)
-            self.assertEqual([str(c) for c in layout.get_row_at(0)], ['1+1', '4', '4.0 KiB', 'no', 'yes'])
+            self.assertEqual([str(c) for c in layout.get_row_at(0)], ['1+1', '4', '4.0 KiB', 'no', 'no', 'yes'])
             await self.tab(app, pilot, 'groups')
             groups = app.query_one('#group-table', DataTable)
             self.assertEqual(groups.row_count, 2, str(app.query_one('#status', Static).content))
@@ -118,8 +120,8 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn('missing indexes: 6,7,8', str(app.query_one('#detail', Static).content))
             await self.tab(app, pilot, 'workers')
             self.assertEqual(str(app.query_one('#worker-table', DataTable).get_row_at(0)[0]), 'worker-1')
-            await self.tab(app, pilot, 'findings')
-            findings = app.query_one('#finding-table', DataTable)
+            await self.tab(app, pilot, 'candidates')
+            findings = app.query_one('#candidate-table', DataTable)
             self.assertEqual(findings.row_count, 1)
             findings.focus()
             await pilot.press('enter')
@@ -131,7 +133,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await pilot.press('[')
             await self.settle(app, pilot)
             self.assertEqual(app.query_one('#views', TabbedContent).active, 'layouts')
-            self.assertTrue(all(c.split()[0] in ('stats', 'pools', 'groups', 'layouts', 'workers', 'findings')
+            self.assertTrue(all(c.split()[0] in ('stats', 'pools', 'groups', 'layouts', 'workers', 'candidates')
                                 for c in self.connection.commands))
         self.assertIsNone(self.connection._writer)
 
@@ -140,7 +142,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             result = dict(local='1+1+?', ingress='1+1+1', gc=gc, blobs=blobs,
                           logical_bytes=1024 * blobs, observed_replica_bytes=2048 * blobs,
                           missing_metadata_blobs=blobs if phantom else 0,
-                          phantom_like=phantom, write2x2_candidate=candidate)
+                          phantom_like=phantom, inv1_candidate=False, inv2_candidate=candidate)
             return dict(result, **kwargs)
 
         buckets = [bucket(3, candidate=True), bucket(2, gc='soft_with_keep', phantom=True),
@@ -157,8 +159,8 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             table = app.query_one('#layout-table', DataTable)
             self.assertEqual(table.row_count, 2)
             self.assertEqual([str(c) for c in table.get_row_at(0)],
-                             ['1+1', '6', '6.0 KiB', 'mixed (2/6)', 'mixed (3/6)'])
-            self.assertEqual([str(c) for c in table.get_row_at(1)], ['2+2', '10', '10.0 KiB', 'no', 'no'])
+                             ['1+1', '6', '6.0 KiB', 'mixed (2/6)', 'no', 'mixed (3/6)'])
+            self.assertEqual([str(c) for c in table.get_row_at(1)], ['2+2', '10', '10.0 KiB', 'no', 'no', 'no'])
             summary = app.query_one('#gc-summary', Collapsible)
             self.assertTrue(summary.collapsed)
             self.assertIn('23 blobs', summary.title)
@@ -172,11 +174,11 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(details.row_count, 3)
             self.assertEqual([str(c) for c in details.get_row_at(0)],
                              ['1+1+?', '1+1+?', '1+1+1', 'no_covering_barrier', '3',
-                              '3.0 KiB', '6.0 KiB', '0', 'no', 'yes'])
+                              '3.0 KiB', '6.0 KiB', '0', 'no', 'no', 'yes'])
             self.assertNotIn('Excluded:', str(app.query_one('#detail', Static).content))
             app.query_one('#layout-filter', Select).value = 'soft_with_keep'
             await pilot.pause()
-            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '2', '2.0 KiB', 'yes', 'no'])
+            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '2', '2.0 KiB', 'yes', 'no', 'no'])
             app.query_one('#layout-filter', Select).value = 'all'
             await pilot.pause()
             self.assertEqual([str(c) for c in table.get_row_at(0)][:3], ['1+1', '29', '29.0 KiB'])
@@ -184,15 +186,15 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await pilot.click('#show-phantom-like')
             await pilot.pause()
             self.assertEqual([str(c) for c in table.get_row_at(0)],
-                             ['1+1', '22', '22.0 KiB', 'no', 'mixed (3/22)'])
+                             ['1+1', '22', '22.0 KiB', 'no', 'no', 'mixed (3/22)'])
             self.assertEqual(details.row_count, 4)
             self.assertIn('18 blobs', summary.title)
             self.assertEqual(app.query_one('#gc-table', DataTable).row_count, 2)
             self.assertIn('Selected: 32 blobs', str(app.query_one('#detail', Static).content))
-            await pilot.click('#write2x2-candidate-only')
+            await pilot.click('#inv2-candidate-only')
             await pilot.pause()
             self.assertEqual(table.row_count, 1)
-            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '3', '3.0 KiB', 'no', 'yes'])
+            self.assertEqual([str(c) for c in table.get_row_at(0)], ['1+1', '3', '3.0 KiB', 'no', 'no', 'yes'])
             self.assertEqual(details.row_count, 1)
             self.assertFalse(summary.display)
             app.query_one('#layout-filter', Select).value = 'hard_barrier'
@@ -204,8 +206,8 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await self.settle(app, pilot)
             self.assertEqual(str(table.get_row_at(0)[1]), '3')
             self.assertFalse(app.query_one('#show-phantom-like', Checkbox).value)
-            self.assertTrue(app.query_one('#write2x2-candidate-only', Checkbox).value)
-            await pilot.click('#write2x2-candidate-only')
+            self.assertTrue(app.query_one('#inv2-candidate-only', Checkbox).value)
+            await pilot.click('#inv2-candidate-only')
             await pilot.pause()
             self.assertEqual(str(table.get_row_at(0)[1]), '4')
             await pilot.click('#show-phantom-like')
@@ -225,14 +227,14 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
                 app.action_refresh()
                 await self.settle(app, pilot)
                 self.assertEqual(table.row_count, 1)
-                self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2', '1', '1.0 GiB', 'unknown', 'unknown'])
+                self.assertEqual([str(c) for c in table.get_row_at(0)], ['2+2', '1', '1.0 GiB', 'unknown', 'unknown', 'unknown'])
             await pilot.click('#show-phantom-like')
             await pilot.pause()
             self.assertEqual(table.row_count, 1)
-            await pilot.click('#write2x2-candidate-only')
+            await pilot.click('#inv2-candidate-only')
             await pilot.pause()
             self.assertEqual(table.row_count, 0)
-            await pilot.click('#write2x2-candidate-only')
+            await pilot.click('#inv2-candidate-only')
             await pilot.pause()
             self.assertEqual(table.row_count, 1)
 
@@ -241,7 +243,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             return dict(local=local, ingress='3+3+3', gc='soft_with_keep', blobs=blobs,
                         logical_bytes=100 * blobs, observed_replica_bytes=200 * blobs,
                         missing_metadata_blobs=blobs if phantom else 0,
-                        phantom_like=phantom, write2x2_candidate=candidate)
+                        phantom_like=phantom, inv1_candidate=candidate, inv2_candidate=candidate)
 
         self.replace_report([
             bucket('2+2+2', 100), bucket('2+1+1', 3), bucket('1+2+1', 4, phantom=True),
@@ -257,7 +259,7 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
                              ['0+0', '1+0', '2+1', '2+2', '3+1'])
             self.assertEqual([str(table.get_row_at(i)[1]) for i in range(table.row_count)],
                              ['1', '38', '18', '107', '2'])
-            self.assertEqual([str(cell) for cell in table.get_row_at(2)][3:], ['mixed (4/18)', 'mixed (6/18)'])
+            self.assertEqual([str(cell) for cell in table.get_row_at(2)][3:], ['mixed (4/18)', 'mixed (6/18)', 'mixed (6/18)'])
             table.move_cursor(row=2)
             table.focus()
             await pilot.press('enter')
@@ -268,6 +270,99 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
                              ['2+1+0', '1+1+2', '1+2+1', '2+1+1'])
             self.assertEqual([str(details.get_row_at(i)[1]) for i in range(details.row_count)],
                              ['2+1+0', '2+1+1', '2+1+1', '2+1+1'])
+
+    async def test_candidate_categories_group_scope_and_pagination(self):
+        self.master.console('scan %d' % self.gid)
+        job = self.master.rpc('/claim', dict(worker='worker-1'))['job']
+        now = time.time()
+        bucket = dict(local='0+1+?', ingress='1+1+1', gc='no_covering_barrier', blobs=1,
+                      logical_bytes=4096, observed_replica_bytes=4096, missing_metadata_blobs=0,
+                      phantom_like=False, inv1_candidate=True, inv2_candidate=True)
+        report = dict(version=1, group_id=self.gid, completed_vdisks=list(range(6)),
+                      buckets=[bucket], totals=write2x2_report.totals([bucket]))
+        self.master.rpc('/result', dict(worker='worker-1', group=self.gid, token=job['token'], result=dict(
+            candidates={'inv1_candidate': ['[42:7:258:3:5:4096:0]'],
+                        'inv2_candidate': ['[42:7:258:3:5:4096:0]']},
+            candidates_complete=True, completed_vdisks=list(range(6)), missing_vdisks=[6, 7, 8],
+            scan_report=report, started_at=now - 1, finished_at=now)))
+        app = self.app()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await self.settle(app, pilot)
+            await self.tab(app, pilot, 'candidates')
+            table = app.query_one('#candidate-table', DataTable)
+            self.assertEqual(table.row_count, 2)
+            self.assertEqual({str(table.get_row_at(i)[1]) for i in range(table.row_count)},
+                             {'inv1_candidate', 'inv2_candidate'})
+            app.query_one('#candidate-category', Select).value = 'inv1_candidate'
+            await self.settle(app, pilot)
+            self.assertEqual(table.row_count, 1)
+            self.assertEqual(str(table.get_row_at(0)[2]), '[42:7:258:3:5:4096:0]')
+            table.focus()
+            await pilot.press('enter')
+            await self.settle(app, pilot)
+            self.assertEqual(app.detail_target, ('group', str(self.gid)))
+            await self.tab(app, pilot, 'candidates')
+            self.assertIn('candidates inv1_candidate %d 0 1000' % self.gid, self.connection.commands)
+            await pilot.click('#candidate-selected-group')
+            await self.settle(app, pilot)
+            self.assertEqual(self.connection.commands[-1], 'candidates inv1_candidate all 0 1000')
+
+            original_request = self.connection.request
+
+            async def request(command):
+                if not command.startswith('candidates '):
+                    return await original_request(command)
+                self.connection.commands.append(command)
+                _, category, group, offset, limit = command.split()
+                offset, limit = int(offset), int(limit)
+                rows = [dict(gid=self.gid, category=category, blob=f'[42:7:{i}:3:5:4096:0]',
+                             first_seen=time.time(), last_seen=time.time(), coverage=list(range(6)))
+                        for i in range(offset, min(offset + limit, 1001))]
+                return json.dumps(dict(category=category, group=None, offset=offset, limit=limit,
+                                       total=1001, rows=rows))
+
+            with patch.object(self.connection, 'request', side_effect=request):
+                app.action_refresh()
+                await self.settle(app, pilot)
+                self.assertEqual(table.row_count, 1000)
+                self.assertTrue(app.query_one('#candidate-previous', Button).disabled)
+                self.assertFalse(app.query_one('#candidate-next', Button).disabled)
+                await pilot.click('#candidate-next')
+                await self.settle(app, pilot)
+                self.assertEqual(table.row_count, 1)
+                self.assertIn('1,001–1,001 of 1,001', str(app.query_one('#candidate-summary', Static).content))
+                self.assertFalse(app.query_one('#candidate-previous', Button).disabled)
+                self.assertTrue(app.query_one('#candidate-next', Button).disabled)
+                await pilot.click('#candidate-previous')
+                await self.settle(app, pilot)
+                self.assertEqual(table.row_count, 1000)
+                app.query_one('#candidate-category', Select).value = 'inv2_candidate'
+                await self.settle(app, pilot)
+                self.assertEqual(app._candidate_offset, 0)
+                self.assertEqual(self.connection.commands[-1], 'candidates inv2_candidate all 0 1000')
+
+    async def test_invariant_filters_are_independent_and_overlap(self):
+        def bucket(inv1_candidate, blobs):
+            return dict(local='0+1+?' if inv1_candidate else '1+1+?', ingress='1+1+1',
+                        gc='no_covering_barrier', blobs=blobs, logical_bytes=1024 * blobs,
+                        observed_replica_bytes=(1 if inv1_candidate else 2) * 1024 * blobs,
+                        missing_metadata_blobs=0, phantom_like=False, inv1_candidate=inv1_candidate, inv2_candidate=True)
+
+        self.replace_report([bucket(True, 2), bucket(False, 3)])
+        app = self.app()
+        async with app.run_test(size=(150, 40)) as pilot:
+            await self.open_pool(app, pilot)
+            table = app.query_one('#layout-table', DataTable)
+            self.assertEqual(sum(int(str(table.get_row_at(i)[1])) for i in range(table.row_count)), 5)
+            await pilot.click('#inv2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(sum(int(str(table.get_row_at(i)[1])) for i in range(table.row_count)), 5)
+            await pilot.click('#inv1-candidate-only')
+            await pilot.pause()
+            self.assertEqual(str(table.get_row_at(0)[1]), '2')
+            await pilot.click('#inv2-candidate-only')
+            await pilot.pause()
+            self.assertEqual(str(table.get_row_at(0)[1]), '2')
 
     async def test_buttons_and_raw_commands(self):
         app = self.app()

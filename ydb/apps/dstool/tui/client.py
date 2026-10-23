@@ -84,6 +84,11 @@ class ConsoleApp(App):
     #detail { height: auto; max-height: 7; overflow-y: auto; }
     #layout-filter { width: 55; }
     #annotation-filters { height: auto; }
+    #candidate-controls { height: auto; }
+    #candidate-category { width: 24; }
+    #candidate-selected-group { width: 35; }
+    #candidate-controls Button { min-width: 10; width: 10; }
+    #candidate-summary { height: auto; }
     #gc-table { height: 5; }
     #bucket-table { height: 10; }
     #gc-summary, #bucket-details { height: auto; padding: 0; }
@@ -93,12 +98,12 @@ class ConsoleApp(App):
         'pool-table': ('Pool', 'Key', 'Reports', 'Full', 'Partial', 'Never', 'Outdated', 'Stale',
                        'Failed', 'Blobs', 'Size', 'Oldest'),
         'group-table': ('Group', 'Pool', 'Generation', 'Scan age', 'Candidates', 'Worker', 'Due', 'Error'),
-        'layout-table': ('Local2', 'Blobs', 'Size', 'phantom_like', 'write2x2_candidate'),
+        'layout-table': ('Local2', 'Blobs', 'Size', 'phantom_like', 'inv1_candidate', 'inv2_candidate'),
         'gc-table': ('GC', 'Blobs', 'Size'),
         'bucket-table': ('Local', 'Local3', 'Ingress', 'GC', 'Blobs', 'Size', 'Replica size', 'Missing metadata',
-                         'phantom_like', 'write2x2_candidate'),
+                         'phantom_like', 'inv1_candidate', 'inv2_candidate'),
         'worker-table': ('Worker', 'Last seen', 'Info'),
-        'finding-table': ('Group', 'Blob', 'Status', 'First seen', 'Last seen', 'Coverage'),
+        'candidate-table': ('Group', 'Category', 'Blob', 'First seen', 'Last seen', 'Coverage', 'State'),
     }
 
     def __init__(self, path, refresh=5, timeout=10, *, connection=None):
@@ -112,6 +117,10 @@ class ConsoleApp(App):
         self._connected = False
         self._layout_data = None
         self._selected_layout = None
+        self._candidate_offset = 0
+        self._candidate_total = 0
+        self._candidate_category = 'all'
+        self._candidate_selected_group = True
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon='>')
@@ -136,7 +145,8 @@ class ConsoleApp(App):
                              value='active', allow_blank=False, id='layout-filter')
                 with Horizontal(id='annotation-filters'):
                     yield Checkbox('Show phantom_like', value=True, id='show-phantom-like')
-                    yield Checkbox('Show write2x2_candidate only', id='write2x2-candidate-only')
+                    yield Checkbox('Show inv1_candidate only', id='inv1-candidate-only')
+                    yield Checkbox('Show inv2_candidate only', id='inv2-candidate-only')
                 yield Static('Local: ? = incomplete realm; 0 = all three VDisks scanned, no part. '
                              'Local3: descending, ? last. Local2: first two of Local3. '
                              'Enter: Local / ingress / GC details. mixed = yes / blobs; unknown = annotation unavailable.', classes='hint')
@@ -147,9 +157,16 @@ class ConsoleApp(App):
                     yield DataTable(id='bucket-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Workers', id='workers'):
                 yield DataTable(id='worker-table', cursor_type='row', zebra_stripes=True)
-            with TabPane('Findings', id='findings'):
-                yield Static('Up to 1000 unresolved findings. Enter opens the group histogram.', classes='hint')
-                yield DataTable(id='finding-table', cursor_type='row', zebra_stripes=True)
+            with TabPane('Candidates', id='candidates'):
+                yield Static('Restore candidates collected by the master. Enter opens the group histogram.', classes='hint')
+                with Horizontal(id='candidate-controls'):
+                    yield Select([('All categories', 'all'), ('inv1_candidate', 'inv1_candidate'), ('inv2_candidate', 'inv2_candidate')],
+                                 value='all', allow_blank=False, id='candidate-category')
+                    yield Checkbox('Selected group when available', value=True, id='candidate-selected-group')
+                    yield Button('Previous', id='candidate-previous', disabled=True)
+                    yield Button('Next', id='candidate-next', disabled=True)
+                yield Static('', id='candidate-summary', markup=False)
+                yield DataTable(id='candidate-table', cursor_type='row', zebra_stripes=True)
             with TabPane('Console', id='console'):
                 yield RichLog(id='log', max_lines=2000, wrap=True, min_width=0, markup=False)
         yield Input(placeholder='Console command (help, layouts GROUP, scan GROUP, interval SEC, …)', id='command')
@@ -177,7 +194,7 @@ class ConsoleApp(App):
 
     def _move_tab(self, step):
         tabs = self.query_one('#views', TabbedContent)
-        order = ('pools', 'groups', 'layouts', 'workers', 'findings', 'console')
+        order = ('pools', 'groups', 'layouts', 'workers', 'candidates', 'console')
         self.set_focus(tabs.query_one(Tabs))
         tabs.active = order[(order.index(tabs.active) + step) % len(order)]
 
@@ -205,6 +222,9 @@ class ConsoleApp(App):
         for name in ('pause', 'scan', 'inventory'):
             self.query_one('#' + name, Button).disabled = not self._connected or self._command_busy
         self.query_one('#pause', Button).label = 'Resume' if str(self.stats.get('paused')) == '1' else 'Pause'
+        self.query_one('#candidate-previous', Button).disabled = not self._connected or self._candidate_offset == 0
+        self.query_one('#candidate-next', Button).disabled = (
+            not self._connected or self._candidate_offset + 1000 >= self._candidate_total)
 
     def _table(self, name, rows):
         table = self.query_one('#' + name, DataTable)
@@ -219,9 +239,16 @@ class ConsoleApp(App):
             table.move_cursor(row=keys.index(selected), animate=False, scroll=False)
         table.scroll_to(x=offset.x, y=offset.y, animate=False)
 
+    def _candidate_query(self):
+        category = self._candidate_category
+        selected = self._candidate_selected_group
+        group = self.detail_target[1] if selected and self.detail_target and self.detail_target[0] == 'group' else 'all'
+        return category, group, self._candidate_offset
+
     async def refresh_view(self):
         tabs = self.query_one('#views', TabbedContent)
         view, target = tabs.active, self.detail_target
+        candidate_query = self._candidate_query()
         try:
             self.stats = json.loads(await self.connection.request('stats'))
             s = self.stats
@@ -229,14 +256,17 @@ class ConsoleApp(App):
                 f"{'PAUSED' if str(s.get('paused')) == '1' else 'RUNNING'}  "
                 f"Groups: {s.get('groups', 0)}  Busy: {s.get('busy') or 0}  "
                 f"Workers: {s.get('workers_alive', 0)}  Scans: {s.get('scans') or 0}  "
-                f"Failed: {s.get('failed') or 0}  Findings: {s.get('unresolved_findings', 0)}  "
+                f"Failed: {s.get('failed') or 0}  Candidates: {s.get('unresolved_candidates', 0)}  "
                 f"Stale inventory: {s.get('stale_inventory_groups', 0)}"
                 + (f"\nDiscovery error: {s['discovery_error']}" if s.get('discovery_error') else ''))
-            command = {'pools': 'pools', 'groups': 'groups brief', 'workers': 'workers', 'findings': 'findings'}.get(view)
+            command = {'pools': 'pools', 'groups': 'groups brief', 'workers': 'workers'}.get(view)
             if view == 'layouts' and target:
                 command = ('layouts ' if target[0] == 'group' else 'pools ') + shlex.quote(target[1])
+            if view == 'candidates':
+                command = 'candidates %s %s %d 1000' % candidate_query
             response = await self.connection.request(command) if command else None
-            if tabs.active == view and self.detail_target == target:
+            if tabs.active == view and self.detail_target == target and (
+                    view != 'candidates' or self._candidate_query() == candidate_query):
                 self._render(view, response, target)
             self._status('Connected · updated ' + time.strftime('%H:%M:%S'), True)
         except CommandError as exc:
@@ -267,10 +297,20 @@ class ConsoleApp(App):
                 'now' if g['due'] <= now else 'in ' + age(g['due'] - now), g['error'])) for g in json_rows(response)])
         elif view == 'workers':
             self._table('worker-table', [(w['id'], (w['id'], since(w['seen']), w['info'])) for w in json_rows(response)])
-        elif view == 'findings':
-            self._table('finding-table', [(json.dumps([f['gid'], f['blob']]), (
-                f['gid'], f['blob'], f['status'], since(f['first_seen']), since(f['last_seen']),
-                f.get('coverage'))) for f in json_rows(response)])
+        elif view == 'candidates':
+            data = json.loads(response)
+            self._candidate_total = data['total']
+            start = data['offset'] + 1 if data['rows'] else 0
+            end = data['offset'] + len(data['rows']) if data['rows'] else 0
+            scope = 'all groups' if data['group'] is None else 'group ' + str(data['group'])
+            self.query_one('#candidate-summary', Static).update(
+                f"{scope} · {data['category']} · {start:,}–{end:,} of {data['total']:,} entries")
+            self._table('candidate-table', [(json.dumps([f['gid'], f['category'], f['blob']]), (
+                f['gid'], f['category'], f['blob'], since(f['first_seen']), since(f['last_seen']),
+                ','.join(map(str, f['coverage'])),
+                '; '.join(label for key, label in (('outdated', 'outdated'), ('inventory_stale', 'stale inventory'))
+                          if f.get(key)))) for f in data['rows']])
+            self._update_buttons()
         elif view == 'layouts':
             self._render_layout(json.loads(response), target)
 
@@ -308,9 +348,11 @@ class ConsoleApp(App):
             if data.get('stream_errors'):
                 text += '\nStream errors: ' + json.dumps(data['stream_errors'], ensure_ascii=False)
         show_phantom = self.query_one('#show-phantom-like', Checkbox).value
-        candidates_only = self.query_one('#write2x2-candidate-only', Checkbox).value
+        inv1_candidate_only = self.query_one('#inv1-candidate-only', Checkbox).value
+        inv2_candidate_only = self.query_one('#inv2-candidate-only', Checkbox).value
         filtered = [b for b in buckets if (show_phantom or b.get('phantom_like') is not True)
-                    and (not candidates_only or b.get('write2x2_candidate') is True)]
+                    and (not inv1_candidate_only or b.get('inv1_candidate') is True)
+                    and (not inv2_candidate_only or b.get('inv2_candidate') is True)]
         selected_gc = self.query_one('#layout-filter', Select).value
         visible = [b for b in filtered if selected_gc == 'all' or
                    (b['gc'] in ACTIVE_GC if selected_gc == 'active' else b['gc'] == selected_gc)]
@@ -356,10 +398,20 @@ class ConsoleApp(App):
     def on_select_changed(self, event: Select.Changed):
         if event.select.id == 'layout-filter' and self._layout_data:
             self._render_layout(*self._layout_data)
+        elif event.select.id == 'candidate-category':
+            if event.value not in ('all', 'inv1_candidate', 'inv2_candidate'):
+                return
+            self._candidate_category = event.value
+            self._candidate_offset = 0
+            self.action_refresh()
 
     def on_checkbox_changed(self, event: Checkbox.Changed):
-        if event.checkbox.id in ('show-phantom-like', 'write2x2-candidate-only') and self._layout_data:
+        if event.checkbox.id in ('show-phantom-like', 'inv1-candidate-only', 'inv2-candidate-only') and self._layout_data:
             self._render_layout(*self._layout_data)
+        elif event.checkbox.id == 'candidate-selected-group':
+            self._candidate_selected_group = event.value
+            self._candidate_offset = 0
+            self.action_refresh()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
         key = event.row_key.value
@@ -373,10 +425,11 @@ class ConsoleApp(App):
             self.detail_target = ('pool', key)
         elif event.data_table.id == 'group-table':
             self.detail_target = ('group', key)
-        elif event.data_table.id == 'finding-table':
+        elif event.data_table.id == 'candidate-table':
             self.detail_target = ('group', str(json.loads(key)[0]))
         else:
             return
+        self._candidate_offset = 0
         self._selected_layout = None
         self._layout_data = None
         self.query_one('#bucket-details', Collapsible).collapsed = True
@@ -434,3 +487,7 @@ class ConsoleApp(App):
             self.submit_command('scan all')
         elif event.button.id == 'inventory':
             self.submit_command('refresh')
+        elif event.button.id in ('candidate-previous', 'candidate-next'):
+            self._candidate_offset = max(0, self._candidate_offset + (
+                -1000 if event.button.id == 'candidate-previous' else 1000))
+            self.action_refresh()

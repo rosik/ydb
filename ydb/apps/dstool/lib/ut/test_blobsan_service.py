@@ -32,8 +32,8 @@ def layout(gid=1, nodes=None):
 
 def args(**kwargs):
     values = dict(interval=3600, retry=60, refresh=300, lease=120, viewer='http://localhost:8765',
-                  endpoint=['localhost'], request_timeout=5, scan_timeout=30, repair_delay=0,
-                  master='unused', secret_file=None, poll=1, heartbeat=1, scan_only=False)
+                  endpoint=['localhost'], request_timeout=5, scan_timeout=30,
+                  master='unused', secret_file=None, poll=1, heartbeat=1)
     values.update(kwargs)
     return SimpleNamespace(**values)
 
@@ -64,16 +64,22 @@ class TestMaster(unittest.TestCase):
     def claim(self, worker='one'):
         return self.master.rpc('/claim', {'worker': worker})['job']
 
-    def result(self, job, findings, worker='one', completed=None):
+    def result(self, job, candidates, worker='one', completed=None):
         completed = list(range(9)) if completed is None else completed
-        result = dict(findings=findings, completed_vdisks=completed,
-                      missing_vdisks=sorted(set(range(9)) - set(completed)))
+        if not isinstance(candidates, dict):
+            candidates = {'inv2_candidate': list(candidates)}
+        candidates = {category: sorted(candidates.get(category, [])) for category in ('inv1_candidate', 'inv2_candidate')}
+        now = time.time()
+        result = dict(candidates=candidates, candidates_complete=svc.has_two_complete_realms(completed),
+                      completed_vdisks=completed, missing_vdisks=sorted(set(range(9)) - set(completed)),
+                      scan_report=scan_report(completed, job['layout']['id']), started_at=now - 2, finished_at=now - 1)
         return self.master.rpc('/result', dict(worker=worker, group=job['layout']['id'], token=job['token'], result=result))
 
     def observation(self, job, completed=tuple(range(9)), blobs=1):
         report = scan_report(completed, job['layout']['id'], blobs)
         now = time.time()
-        result = dict(findings={}, findings_complete=False, scan_report=report,
+        result = dict(candidates={'inv1_candidate': [], 'inv2_candidate': []},
+                      candidates_complete=svc.has_two_complete_realms(completed), scan_report=report,
                       completed_vdisks=list(completed), missing_vdisks=sorted(set(range(9)) - set(completed)),
                       started_at=now - 2, finished_at=now - 1)
         body = dict(worker='one', group=job['layout']['id'], token=job['token'], result=result)
@@ -108,18 +114,18 @@ class TestMaster(unittest.TestCase):
         self.assertNotIn('layout', group)
         self.assertIn('last_result', json.loads(self.master.console('groups')))
 
-    def test_observation_accepts_partial_coverage_and_preserves_findings(self):
-        self.result(self.claim(), {BLOB: 'request_ok'})
+    def test_partial_observation_preserves_candidates_until_complete_scan(self):
+        self.result(self.claim(), [BLOB])
         self.master.console('scan 1')
         self.observation(self.claim(), completed=(0, 1))
         pool, = json.loads(self.master.console('pools'))
         self.assertEqual(pool['partial_groups'], 1)
         self.assertEqual(pool['buckets'][0]['local'], '?+?+?')
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
         self.assertIsNone(json.loads(self.master.console('layouts 1'))['candidates'])
         self.master.console('scan 1')
         self.observation(self.claim())
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
 
     def test_failed_attempt_preserves_previous_scan_report(self):
         self.observation(self.claim())
@@ -215,74 +221,79 @@ class TestMaster(unittest.TestCase):
         with self.master.db:
             self.master.db.execute('UPDATE groups SET expires=0')
         new = self.claim('two')
-        self.assertFalse(self.result(old, {BLOB: 'request_ok'})['accepted'])
+        self.assertFalse(self.result(old, [BLOB])['accepted'])
         self.assertTrue(self.result(new, {}, 'two')['accepted'])
 
     def test_result_idempotence_reappearance_and_restart(self):
         job = self.claim()
-        self.assertTrue(self.result(job, {BLOB: 'request_ok'})['accepted'])
-        self.assertTrue(self.result(job, {BLOB: 'request_ok'})['accepted'])
+        self.assertTrue(self.result(job, [BLOB])['accepted'])
+        self.assertTrue(self.result(job, [BLOB])['accepted'])
         self.assertEqual(json.loads(self.master.console('stats'))['scans'], 1)
         self.master.db.close()
         self.master = svc.Master(args(), self.directory)
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
         self.master.console('scan all')
         self.result(self.claim(), {})
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
         self.master.console('scan 1')
-        self.result(self.claim(), {BLOB: 'absent'})
+        self.result(self.claim(), [BLOB])
         self.assertEqual(json.loads(self.master.console('stats'))['new_total'], 2)
 
-    def test_failed_scan_preserves_findings(self):
-        self.result(self.claim(), {BLOB: 'request_ok'})
+    def test_failed_scan_preserves_candidates(self):
+        self.result(self.claim(), [BLOB])
         self.master.console('scan all')
         job = self.claim()
         self.master.rpc('/result', dict(worker='one', group=1, token=job['token'], result={'error': 'stream lost'}))
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
 
-    def test_coverage_change_does_not_resolve_findings(self):
-        self.result(self.claim(), {BLOB: 'request_ok'}, completed=list(range(6)))
+    def test_coverage_change_does_not_resolve_candidates(self):
+        self.result(self.claim(), [BLOB], completed=list(range(6)))
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
         self.master.console('scan all')
         self.result(self.claim(), {})
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
 
-    def test_repeated_changed_coverage_preserves_findings_after_restart(self):
-        self.result(self.claim(), {BLOB: 'request_ok'}, completed=list(range(6)))
+    def test_repeated_changed_coverage_preserves_candidates_after_restart(self):
+        self.result(self.claim(), [BLOB], completed=list(range(6)))
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
         self.master.db.close()
         self.master = svc.Master(args(), self.directory)
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
         row = json.loads(self.master.console('groups'))
         self.assertAlmostEqual(row['due'] - time.time(), args().retry, delta=5)
         self.assertEqual(json.loads(row['last_result'])['disappeared'], 0)
         self.assertEqual(json.loads(row['last_result'])['unresolved'], 1)
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(6)))
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
 
-    def test_findings_resolved_only_against_their_own_coverage(self):
+    def test_candidates_resolved_only_against_their_own_coverage(self):
         other_blob = '[42:7:259:3:5:4096:0]'
-        self.result(self.claim(), {BLOB: 'request_ok'}, completed=list(range(6)))
+        self.result(self.claim(), [BLOB], completed=list(range(6)))
         self.master.console('scan all')
-        self.result(self.claim(), {other_blob: 'absent'}, completed=list(range(3, 9)))
+        self.result(self.claim(), [other_blob], completed=list(range(3, 9)))
         self.master.console('scan all')
         self.result(self.claim(), {}, completed=list(range(3, 9)))
-        active = [json.loads(line)['blob'] for line in self.master.console('findings 1').splitlines()]
-        self.assertEqual(active, [BLOB])
+        active = json.loads(self.master.console('candidates inv2_candidate 1'))['rows']
+        self.assertEqual([row['blob'] for row in active], [BLOB])
         result = json.loads(json.loads(self.master.console('groups'))['last_result'])
         self.assertEqual(result['disappeared'], 1)
 
-    def test_invalid_coverage_rolls_back(self):
+    def test_invalid_candidate_coverage_rolls_back(self):
         job = self.claim()
+        now = time.time()
+        result = dict(candidates={'inv1_candidate': [], 'inv2_candidate': [BLOB]}, candidates_complete=True,
+                      completed_vdisks=[0, 1, 2], missing_vdisks=list(range(3, 9)),
+                      scan_report=scan_report([0, 1, 2]), started_at=now - 2, finished_at=now - 1)
         with self.assertRaises(ValueError):
-            self.result(job, {}, completed=[0, 1, 2])
+            self.master.rpc('/result', dict(worker='one', group=1, token=job['token'], result=result))
         self.assertEqual(json.loads(self.master.console('stats'))['scans'], 0)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 0)
 
     def test_http_transport_and_auth(self):
         server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), svc.API)
@@ -321,26 +332,20 @@ class TestMaster(unittest.TestCase):
             thread.join()
             server.server_close()
 
-    def test_worker_repairs_then_verifies_over_http(self):
-        repaired, reports = False, []
+    def test_worker_collects_both_lists_without_repair_over_http(self):
+        reports, generation_checks = [], []
         sequences = {}
-        generation_checks = []
+        other_blob = '[42:7:259:3:5:4096:0]'
 
         def ydb(_args, url, raw=False):
-            nonlocal repaired
             parsed = svc.urllib.parse.urlsplit(url)
             if parsed.path.endswith('bsgroupinfo'):
                 self.assertEqual(svc.urllib.parse.parse_qs(parsed.query),
                                  {'node_id': ['1,2,3,4,5,6,7,8,9'], 'filter': ['GroupID=1']})
-                generation_checks.append((len(sequences), repaired))
+                generation_checks.append(len(sequences))
                 return {'BSGroupStateInfo': [{'GroupID': 1, 'GroupGeneration': 1, 'ErasureSpecies': 'mirror-3-dc'}]}
-            if parsed.path.endswith('tenantinfo'):
-                return {'TenantInfo': []}
-            if parsed.path.endswith('sysinfo'):
-                return {'SystemStateInfo': [{'NodeId': 1}]}
-            if parsed.path.endswith('blob_range'):
-                repaired = True
-                return {'Status': 'OK', 'Blobs': [BLOB]}
+            self.assertNotIn(parsed.path.rsplit('/', 1)[-1], ('get_blob', 'blob_range', 'restore_part', 'tenantinfo', 'sysinfo'), url)
+            self.assertTrue(raw, url)
             params = svc.urllib.parse.parse_qs(parsed.query)
             session = params['sessionId'][0]
             if session in sequences:
@@ -361,6 +366,8 @@ class TestMaster(unittest.TestCase):
                     svc.STOP.set()
             return result
 
+        scans = [({'inv1_candidate': {BLOB}, 'inv2_candidate': {BLOB, other_blob}}, scan_report(blobs=2)),
+                 ({'inv1_candidate': set(), 'inv2_candidate': set()}, scan_report(blobs=0))]
         server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), svc.API)
         server.master, server.api_secret = self.master, ''
         server_thread = threading.Thread(target=server.serve_forever)
@@ -371,16 +378,18 @@ class TestMaster(unittest.TestCase):
         timer.start()
         try:
             with patch.object(svc, 'ydb_http', side_effect=ydb), patch.object(self.master, 'rpc', side_effect=rpc), \
-                    patch.object(svc, 'run_blobsan', side_effect=lambda *_: (
-                        set() if repaired else {BLOB}, scan_report(blobs=0 if repaired else 1))):
+                    patch.object(svc, 'run_blobsan', side_effect=scans) as analyzer:
                 svc.work(args(master='127.0.0.1:%d' % server.server_port), directory)
             self.assertEqual(len(reports), 2)
-            self.assertEqual(reports[0]['findings'], {BLOB: 'request_ok'})
-            self.assertEqual(reports[1]['findings'], {})
-            self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 0)
-            self.assertEqual(generation_checks, [
-                (0, False), (9, False), (9, True), (9, True), (18, True), (18, True),
-            ])
+            self.assertEqual(analyzer.call_count, 2)
+            self.assertEqual(reports[0]['candidates'], {'inv1_candidate': [BLOB], 'inv2_candidate': sorted([BLOB, other_blob])})
+            self.assertEqual(reports[1]['candidates'], {'inv1_candidate': [], 'inv2_candidate': []})
+            self.assertTrue(all(report['candidates_complete'] for report in reports))
+            self.assertTrue(all('findings' not in report and 'repairs' not in report for report in reports))
+            self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
+            self.assertIn(0, generation_checks)
+            self.assertIn(9, generation_checks)
+            self.assertIn(18, generation_checks)
         finally:
             timer.cancel()
             server.shutdown()
@@ -388,29 +397,197 @@ class TestMaster(unittest.TestCase):
             server.server_close()
             svc.STOP.clear()
 
-    def test_scan_only_worker_publishes_report_without_repair_or_resolving_findings(self):
-        self.result(self.claim(), {BLOB: 'request_ok'})
+    def test_partial_worker_publishes_report_without_resolving_candidates(self):
+        self.result(self.claim(), [BLOB])
         self.master.console('scan 1')
         directory = self.directory / 'worker'
         directory.mkdir()
         now = time.time()
-        coverage = dict(completed_vdisks=list(range(9)), missing_vdisks=[], stream_errors={},
-                        scan_report=scan_report(), started_at=now - 2, finished_at=now - 1)
+        completed = [0, 1, 2]
+        coverage = dict(completed_vdisks=completed, missing_vdisks=list(range(3, 9)), stream_errors={},
+                        scan_report=scan_report(completed), started_at=now - 2, finished_at=now - 1)
+        reports = []
 
         def rpc(url, headers, data, **kwargs):
             action = '/' + url.rsplit('/', 1)[1]
             reply = self.master.rpc(action, data)
             if action == '/result':
+                reports.append(data['result'])
                 svc.STOP.set()
             return reply
 
         with patch.object(svc, 'http', side_effect=rpc), patch.object(svc, 'validate_layout'), \
-                patch.object(svc, 'scan', return_value=({BLOB}, coverage)), patch.object(svc, 'repair') as repair:
-            svc.work(args(scan_only=True), directory)
-        repair.assert_not_called()
+                patch.object(svc, 'scan', return_value=({'inv1_candidate': set(), 'inv2_candidate': set()}, coverage)), \
+                patch.object(svc, 'ydb_http') as fetch:
+            svc.work(args(), directory)
+        fetch.assert_not_called()
+        self.assertEqual(len(reports), 1)
+        self.assertEqual(reports[0]['candidates'], {'inv1_candidate': [], 'inv2_candidate': []})
+        self.assertFalse(reports[0]['candidates_complete'])
         self.assertEqual(json.loads(self.master.console('layouts 1'))['scan_report']['totals']['blobs'], 1)
-        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_findings'], 1)
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 1)
         svc.STOP.clear()
+
+    def test_dual_category_lists_persist_with_union_counts_and_pagination(self):
+        other_blob = '[42:7:259:3:5:4096:0]'
+        job = self.claim()
+        self.assertTrue(self.result(job, {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB, other_blob]})['accepted'])
+        self.master.db.close()
+        self.master = svc.Master(args(), self.directory)
+        result = json.loads(json.loads(self.master.console('groups'))['last_result'])
+        self.assertEqual(result['candidates'], 2)
+        self.assertEqual(result['candidate_counts'], {'inv1_candidate': 1, 'inv2_candidate': 2})
+        self.assertEqual(json.loads(self.master.console('groups'))['last_count'], 2)
+        stats = json.loads(self.master.console('stats'))
+        self.assertEqual(stats['inv1_candidates'], 1)
+        self.assertEqual(stats['inv2_candidates'], 2)
+        first = json.loads(self.master.console('candidates inv2_candidate 1 0 1'))
+        second = json.loads(self.master.console('candidates inv2_candidate 1 1 1'))
+        self.assertEqual(first['category'], 'inv2_candidate')
+        self.assertEqual(first['group'], 1)
+        self.assertEqual((first['offset'], first['limit'], first['total']), (0, 1, 2))
+        self.assertEqual([row['blob'] for row in first['rows'] + second['rows']], sorted([BLOB, other_blob]))
+        row = json.loads(self.master.console('candidates inv1_candidate all'))['rows'][0]
+        self.assertEqual((row['gid'], row['category'], row['blob']), (1, 'inv1_candidate', BLOB))
+        self.assertEqual(row['coverage'], list(range(9)))
+        self.assertLessEqual(row['first_seen'], row['last_seen'])
+        self.master.console('scan all')
+        job = self.claim()
+        self.master.rpc('/result', dict(worker='one', group=1, token=job['token'], result={'error': 'stream lost'}))
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 1)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 2)
+
+    def test_categories_resolve_independently_against_their_own_coverage(self):
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]}, completed=list(range(6)))
+        self.master.console('scan all')
+        self.result(self.claim(), {'inv1_candidate': [], 'inv2_candidate': [BLOB]}, completed=list(range(6)))
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 0)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 1)
+        self.master.console('scan all')
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]}, completed=list(range(3, 9)))
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(6)))
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 1)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 1)
+        self.master.console('scan all')
+        self.result(self.claim(), {}, completed=list(range(3, 9)))
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 0)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 0)
+
+    def test_legacy_findings_are_preserved_without_becoming_restore_candidates(self):
+        now = time.time()
+        with self.master.db:
+            self.master.db.execute('INSERT INTO findings VALUES(?,?,?,?,?,?,?)',
+                                   (1, BLOB, now, now, 1, 'request_ok', json.dumps(list(range(9)))))
+        self.master.db.close()
+        self.master = svc.Master(args(), self.directory)
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 0)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 0)
+        self.assertEqual(self.master.db.execute('SELECT active,status FROM findings WHERE blob=?', (BLOB,)).fetchone()['status'],
+                         'request_ok')
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]})
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 1)
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 1)
+
+    def test_candidate_list_command_rejects_invalid_category_and_pagination(self):
+        for command in ('candidates unknown', 'candidates inv1_candidate all -1 10', 'candidates inv1_candidate all 0 0'):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                self.master.console(command)
+
+    def test_invalid_candidate_payloads_roll_back_without_mutating_saved_results(self):
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]})
+        self.master.console('scan 1')
+        job = self.claim()
+
+        def snapshot():
+            return {table: [dict(row) for row in self.master.db.execute('SELECT * FROM ' + table)]
+                    for table in ('groups', 'restore_candidates', 'scan_reports', 'workers')}
+
+        original = snapshot()
+        invalid = [None, [], [BLOB], {}, {'inv1_candidate': []},
+                   {'inv1_candidate': [], 'write2x2_candidate': [BLOB]},
+                   {'inv1_candidate': [], 'inv2_candidate': [], 'unknown': []},
+                   {'inv1_candidate': [], 'inv2_candidate': BLOB},
+                   {'inv1_candidate': [], 'inv2_candidate': (BLOB,)},
+                   {'inv1_candidate': [], 'inv2_candidate': [None]},
+                   {'inv1_candidate': [], 'inv2_candidate': [123]},
+                   {'inv1_candidate': [], 'inv2_candidate': ['not-a-blob']},
+                   {'inv1_candidate': [], 'inv2_candidate': ['[42:7:258:3:5:4096:1]']},
+                   {'inv1_candidate': [], 'inv2_candidate': [BLOB, BLOB]},
+                   {'inv1_candidate': [BLOB, BLOB], 'inv2_candidate': [BLOB]},
+                   {'inv1_candidate': [BLOB], 'inv2_candidate': []}]
+        now = time.time()
+        for candidates in invalid:
+            result = dict(candidates=candidates, candidates_complete=True,
+                          completed_vdisks=list(range(9)), missing_vdisks=[],
+                          scan_report=scan_report(), started_at=now - 2, finished_at=now - 1)
+            with self.subTest(candidates=candidates), self.assertRaises(ValueError):
+                self.master.rpc('/result', dict(worker='one', group=1, token=job['token'], result=result))
+            self.assertEqual(snapshot(), original)
+        self.assertTrue(self.result(job, {})['accepted'])
+        self.assertEqual(json.loads(self.master.console('stats'))['unresolved_candidates'], 0)
+
+    def test_legacy_pending_result_is_acknowledged_and_rescheduled_without_relabeling(self):
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]})
+        original_report = json.loads(self.master.console('layouts 1'))['scan_report']
+        original_candidates = json.loads(self.master.console('candidates all'))['rows']
+        self.master.console('scan 1')
+        job = self.claim()
+        other_blob = '[42:7:259:3:5:4096:0]'
+        now = time.time()
+        legacy = dict(findings={other_blob: 'request_ok'}, findings_complete=True,
+                      completed_vdisks=list(range(9)), missing_vdisks=[], scan_report=scan_report(blobs=9),
+                      started_at=now - 2, finished_at=now - 1)
+        pending = dict(group=1, token=job['token'], result=legacy)
+        worker_directory = self.directory / 'worker'
+        worker_directory.mkdir()
+        svc.atomic_json(worker_directory / 'worker.json', {'id': 'one'})
+        svc.atomic_json(worker_directory / 'pending.json', pending)
+        responses = []
+
+        def rpc(url, headers, data, **kwargs):
+            self.assertTrue(url.endswith('/result'))
+            response = self.master.rpc('/result', data)
+            responses.append(response)
+            svc.STOP.set()
+            return response
+
+        with patch.object(svc, 'http', side_effect=rpc), patch.object(svc, 'ydb_http') as fetch:
+            svc.work(args(), worker_directory)
+        svc.STOP.clear()
+        fetch.assert_not_called()
+        self.assertEqual(responses, [{'accepted': True}])
+        self.assertFalse((worker_directory / 'pending.json').exists())
+        self.assertEqual(json.loads(self.master.console('candidates all'))['rows'], original_candidates)
+        detail = json.loads(self.master.console('layouts 1'))
+        self.assertEqual(detail['scan_report'], original_report)
+        self.assertIn('Legacy candidate result', detail['latest_error'])
+        group = json.loads(self.master.console('groups'))
+        self.assertEqual(group['last_count'], 1)
+        self.assertEqual(group['expires'], 0)
+        self.assertAlmostEqual(group['due'] - time.time(), args().retry, delta=5)
+        self.assertEqual(json.loads(self.master.console('stats'))['scans'], 1)
+        self.assertTrue(self.master.rpc('/result', dict(worker='one', **pending))['accepted'])
+        self.assertEqual(json.loads(self.master.console('groups'))['due'], group['due'])
+
+    def test_candidate_rows_mark_outdated_layout_and_stale_inventory(self):
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB]})
+        original = json.loads(self.master.console('candidates all'))
+        self.assertEqual(original['total'], 2)
+        self.assertTrue(all(not row['outdated'] and not row['inventory_stale'] for row in original['rows']))
+        for generation, fingerprint in ((1, 'v2'), (2, 'v1'), (2, 'v2')):
+            changed = dict(layout(), generation=generation, fingerprint=fingerprint)
+            with self.master.db:
+                self.master.db.execute('UPDATE groups SET layout=?,seen=0 WHERE id=1', (json.dumps(changed),))
+            with self.subTest(generation=generation, fingerprint=fingerprint):
+                result = json.loads(self.master.console('candidates all'))
+                self.assertEqual(result['total'], 2)
+                for row in result['rows']:
+                    self.assertTrue(row['outdated'])
+                    self.assertTrue(row['inventory_stale'])
+                    self.assertEqual(row['generation'], 1)
+                    self.assertEqual(row['blob'], BLOB)
+                    self.assertEqual(row['coverage'], list(range(9)))
 
 
 class TestWorker(unittest.TestCase):
@@ -453,15 +630,15 @@ class TestWorker(unittest.TestCase):
                 svc.validate_layout(args(), {'layout': item})
             fetch.assert_not_called()
 
-    def test_relative_blobsan_runs_checked_executable(self):
+    def test_relative_blobsan_runs_checked_executable_once_for_both_categories(self):
         binary = self.directory / 'blobsan'
         binary.write_text('#!/bin/sh\n'
-                          '[ "$#" -eq 6 ] && [ "$1" = --write2x2-candidates ] && [ "$2" = --scan-manifest ] '
+                          '[ "$#" -eq 6 ] && [ "$1" = --restore-canidates ] && [ "$2" = --scan-manifest ] '
                           '&& [ "$4" = --scan-report ] && [ "$6" = mirror-3-dc ] || exit 2\n'
                           'IFS= read -r snapshot\n'
                           '[ "$snapshot" = "opaque snapshot bytes" ] || exit 3\n'
                           "/bin/cat > \"$5\" <<'REPORT'\n" + json.dumps(scan_report()) + '\nREPORT\n'
-                          "printf '%s\\n' 'GroupId# 1 BlobId# " + BLOB + "' >&2\n")
+                          "printf '%s\\n' 'GroupId# 1 BlobId# " + BLOB + " FULL inv1_candidate inv2_candidate' >&2\n")
         binary.chmod(0o700)
         (self.directory / 'snapshot').write_bytes(b'opaque snapshot bytes\n')
         svc.atomic_json(self.directory / 'manifest.json', dict(group_id=1, completed_vdisks=list(range(9))))
@@ -473,9 +650,8 @@ class TestWorker(unittest.TestCase):
 
         def work(parsed, directory):
             self.assertEqual(parsed.blobsan, str(binary.resolve()))
-            for scan_only in (False, True):
-                parsed.scan_only = scan_only
-                self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()), ({BLOB}, scan_report()))
+            self.assertEqual(svc.run_blobsan(parsed, 1, self.directory, threading.Event()),
+                             ({'inv1_candidate': {BLOB}, 'inv2_candidate': {BLOB}}, scan_report()))
 
         previous_cwd = Path.cwd()
         try:
@@ -505,23 +681,43 @@ class TestWorker(unittest.TestCase):
 
             def analyze(_args, gid, directory, cancel):
                 manifest = json.loads((directory / 'manifest.json').read_text())
-                return {BLOB}, scan_report(manifest['completed_vdisks'])
+                return {'inv1_candidate': {BLOB}, 'inv2_candidate': {BLOB}}, scan_report(manifest['completed_vdisks'])
 
             with patch.object(svc, 'ydb_http', side_effect=fetch), patch.object(svc, 'run_blobsan', side_effect=analyze):
                 return svc.scan(args(), {'layout': layout()}, self.directory, threading.Event())
 
         found, coverage = run({7, 8, 9})
-        self.assertEqual(found, {BLOB})
+        self.assertEqual(found, {'inv1_candidate': {BLOB}, 'inv2_candidate': {BLOB}})
         self.assertEqual(coverage['missing_vdisks'], [6, 7, 8])
         _, coverage = run({6, 7, 8, 9})
         self.assertEqual(coverage['completed_vdisks'], list(range(5)))
         with self.assertRaises(RuntimeError):
             run(set(range(1, 10)))
 
-    def test_repair_json_semantics_and_expired_local_lease(self):
-        responses = [{'TenantInfo': []}, {'SystemStateInfo': [{'NodeId': 10}]}, {'Status': 'OK', 'Blobs': []}]
-        with patch.object(svc, 'ydb_http', side_effect=responses):
-            self.assertEqual(svc.repair(args(), {'layout': layout()}, {BLOB}, threading.Event()), {BLOB: 'absent'})
+    def test_analyzer_candidate_tags_are_validated(self):
+        binary = self.directory / 'blobsan'
+        binary.write_text('#!/bin/sh\n'
+                          "/bin/cat > \"$5\" <<'REPORT'\n" + json.dumps(scan_report()) + '\nREPORT\n'
+                          '/bin/cat "$0.stderr" >&2\n')
+        binary.chmod(0o700)
+        output = Path(str(binary) + '.stderr')
+        (self.directory / 'snapshot').write_bytes(b'')
+        svc.atomic_json(self.directory / 'manifest.json', dict(group_id=1, completed_vdisks=list(range(9))))
+        invalid = ['GroupId# 1 BlobId# ' + BLOB,
+                   'GroupId# 1 BlobId# ' + BLOB + ' inv1_candidate',
+                   'GroupId# 1 BlobId# ' + BLOB + ' inv2_candidate unknown',
+                   'GroupId# 2 BlobId# ' + BLOB + ' inv2_candidate',
+                   'GroupId# 1 BlobId# [42:7:258:3:5:4096:1] inv2_candidate',
+                   'GroupId# invalid BlobId# ' + BLOB + ' inv2_candidate']
+        for line in invalid:
+            output.write_text(line + '\n')
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                svc.run_blobsan(args(blobsan=str(binary)), 1, self.directory, threading.Event())
+        output.write_text('GroupId# 1 BlobId# ' + BLOB + ' inv2_candidate\n')
+        self.assertEqual(svc.run_blobsan(args(blobsan=str(binary)), 1, self.directory, threading.Event())[0],
+                         {'inv1_candidate': set(), 'inv2_candidate': {BLOB}})
+
+    def test_expired_local_lease_stops_worker(self):
         cancel = threading.Event()
         cancel.deadline = time.monotonic() - 1
         with self.assertRaises(RuntimeError):
@@ -541,7 +737,7 @@ class TestWorker(unittest.TestCase):
 
         completed = list(range(8))
         with patch.object(svc, 'ydb_http', side_effect=fetch), \
-                patch.object(svc, 'run_blobsan', return_value=(set(), scan_report(completed, blobs=0))):
+                patch.object(svc, 'run_blobsan', return_value=({'inv1_candidate': set(), 'inv2_candidate': set()}, scan_report(completed, blobs=0))):
             _, coverage = svc.scan(args(), {'layout': layout()}, self.directory, threading.Event())
         self.assertEqual(coverage['completed_vdisks'], completed)
         self.assertEqual(coverage['stream_errors'], {8: 'stream interrupted'})
@@ -714,12 +910,12 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(parsed.refresh, 5)
         self.assertFalse(hasattr(parsed, 'db'))
 
-    def test_scan_only_flag(self):
-        parser = ArgumentParser()
-        commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
-        parsed = parser.parse_args(['blobsan-service', 'worker', '--master', 'host:22570',
-                                    '--db', '/tmp/worker', '--scan-only'])
-        self.assertTrue(parsed.scan_only)
+    def test_removed_worker_repair_options_are_rejected(self):
+        for tail in (['--scan-only'], ['--repair-delay', '1']):
+            parser = ArgumentParser()
+            commands.make_command_map_by_structure(parser.add_subparsers(dest='global_command', required=True))
+            with self.subTest(option=tail[0]), patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit):
+                parser.parse_args(['blobsan-service', 'worker', '--master', 'host:22570', '--db', '/tmp/worker'] + tail)
 
 
 class TestScanReportValidation(unittest.TestCase):
@@ -737,8 +933,8 @@ class TestScanReportValidation(unittest.TestCase):
     def test_annotated_buckets_remain_distinct_from_legacy_and_other_annotations(self):
         report = scan_report(blobs=2)
         legacy = report['buckets'][0]
-        candidate = dict(legacy, phantom_like=False, write2x2_candidate=True)
-        phantom = dict(legacy, phantom_like=True, write2x2_candidate=False, missing_metadata_blobs=2)
+        candidate = dict(legacy, phantom_like=False, inv1_candidate=False, inv2_candidate=True)
+        phantom = dict(legacy, phantom_like=True, inv1_candidate=False, inv2_candidate=False, missing_metadata_blobs=2)
         report['buckets'] = [legacy, candidate, phantom]
         report['totals'] = write2x2_report.totals(report['buckets'])
         write2x2_report.validate(report, 1, list(range(9)))
@@ -746,7 +942,8 @@ class TestScanReportValidation(unittest.TestCase):
         write2x2_report.merge(histogram, report['buckets'])
         rows = write2x2_report.histogram_rows(histogram)
         self.assertEqual(len(rows), 3)
-        self.assertIsNone(rows[0]['write2x2_candidate'])
+        self.assertIsNone(rows[0]['inv1_candidate'])
+        self.assertIsNone(rows[0]['inv2_candidate'])
         self.assertEqual(write2x2_report.totals(rows), report['totals'])
 
     def test_empty_and_partial_reports(self):
@@ -765,10 +962,12 @@ class TestScanReportValidation(unittest.TestCase):
                      lambda r: r['buckets'][0].update(blobs=-1),
                      lambda r: r['buckets'][0].update(blobs=True),
                      lambda r: r['buckets'][0].update(phantom_like=1),
-                     lambda r: r['buckets'][0].update(write2x2_candidate='yes'),
+                     lambda r: r['buckets'][0].update(inv1_candidate='yes'),
+                     lambda r: r['buckets'][0].update(inv2_candidate='yes'),
+                     lambda r: r['buckets'][0].update(phantom_like=False, inv1_candidate=True, inv2_candidate=False),
                      lambda r: r['buckets'][0].update(phantom_like=True),
-                     lambda r: r['buckets'][0].update(phantom_like=True, write2x2_candidate=True, missing_metadata_blobs=1),
-                     lambda r: r['buckets'][0].update(phantom_like=False, write2x2_candidate=True, gc='hard_barrier'),
+                     lambda r: r['buckets'][0].update(phantom_like=True, inv2_candidate=True, missing_metadata_blobs=1),
+                     lambda r: r['buckets'][0].update(phantom_like=False, inv2_candidate=True, gc='hard_barrier'),
                      lambda r: r['buckets'][0].update(missing_metadata_blobs=2)]
         for index, mutate in enumerate(mutations):
             with self.subTest(index=index):
