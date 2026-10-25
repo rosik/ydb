@@ -437,6 +437,113 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await self.settle(app, pilot)
             self.assertTrue(app.query_one('#restore-start', Button).disabled)
 
+    async def test_automatic_restore_diagnostics_are_global_and_survive_reconnect(self):
+        automatic = dict(enabled=True, state='running', pending_inv1=1200, pending_inv2_only=4500,
+                         inflight_blobs=500, awaiting_rescan=600, retry_wait=20, unknown_outcomes=2,
+                         excluded_blobs=40, active_unique_blobs=6862, completed_blobs=5000,
+                         completed_bytes=4096 * 5000, blobs_per_second=125, bytes_per_second=4096 * 125,
+                         eta_seconds=192, last_batch_finished_at=time.time() - 2,
+                         phase_rates=dict(inv1=dict(pending=1200, blobs_per_second=100, eta_seconds=12),
+                                          inv2_only=dict(pending=4500, blobs_per_second=25, eta_seconds=180)),
+                         current_batch=dict(id='batch-123', blobs=500, requests=3000, started_at=time.time() - 1),
+                         status_counts={'OK': 2000, 'ALREADY': 500, 'DEADLINE': 2}, errors=[
+                             dict(gid=self.gid, blob='[42:7:258:3:5:4096:0]', vdisk='[80000001:7:0:0:0]',
+                                  status='DEADLINE', origin='VRESTORE_PART_ACTOR', error='Timed out'),
+                             dict(gid=None, blob=None, error='HTTP response incomplete'),
+                         ])
+        console = self.master.console
+
+        def with_automatic(command):
+            response = console(command)
+            if command == 'stats' or command.startswith('restore-preview '):
+                response = json.dumps(dict(json.loads(response), automatic=automatic))
+            return response
+
+        with patch.object(self.master, 'console', side_effect=with_automatic):
+            app = self.app()
+            async with app.run_test(size=(120, 35)) as pilot:
+                await self.settle(app, pilot)
+                self.assertIn('Auto restore running · inv1 1,200 · inv2 only 4,500',
+                              str(app.query_one('#summary', Static).content))
+                await self.tab(app, pilot, 'restore')
+                app.query_one('#restore-category', Select).value = 'inv2_candidate'
+                await self.settle(app, pilot)
+                app.detail_target = ('group', str(self.gid))
+                await pilot.click('#restore-selected-group')
+                await self.settle(app, pilot)
+                progress = str(app.query_one('#restore-progress', Static).content)
+                for expected in (
+                    'Automatic restore · running · all groups · inv1 first',
+                    'Remaining eligible: 5,700 blobs · inv1: 1,200 · inv2 only: 4,500',
+                    'In flight: 500 · Awaiting rescan: 600 · Retry wait: 20',
+                    'Unknown outcomes: 2 · Excluded (outdated / stale): 40 · Active candidates: 6,862',
+                    'Success rate (last 5m): 125.0 blobs/s · 500.0 KiB/s · ETA (eligible queue): 3m',
+                    'Phase rates (last 5m): inv1: 100.0 blobs/s, ETA 12s · inv2 only: 25.0 blobs/s, ETA 3m',
+                    'Successful blob attempts: 5,000 (19.5 MiB)',
+                    'Batch batch-123: 500 blobs · 3,000 VDisk requests',
+                    'VDisk responses (last 5m): ALREADY: 500 · DEADLINE: 2 · OK: 2,000',
+                    'VDiskId [80000001:7:0:0:0] · DEADLINE · VRESTORE_PART_ACTOR: Timed out',
+                    'HTTP response incomplete',
+                ):
+                    self.assertIn(expected, progress)
+                self.assertNotIn('Group None', progress)
+                self.assertIn(f'group {self.gid} · inv2_candidate',
+                              str(app.query_one('#restore-summary', Static).content))
+                self.assertTrue(app.query_one('#restore-start', Button).disabled)
+                self.assertFalse(app.query_one('#restore-preview', Button).disabled)
+                await self.connection.close()
+                automatic['completed_blobs'] = 5500
+                automatic['current_batch'] = None
+                app.action_refresh()
+                await self.settle(app, pilot)
+                progress = str(app.query_one('#restore-progress', Static).content)
+                self.assertIn('Successful blob attempts: 5,500', progress)
+                self.assertNotIn('Batch batch-123', progress)
+                self.assertTrue(app.query_one('#restore-start', Button).disabled)
+                self.assertFalse(any(command.startswith('restore ') for command in self.connection.commands))
+
+    async def test_automatic_restore_unknown_eta_and_disabled_mode(self):
+        automatic = dict(enabled=True, state='ready', pending_inv1=0, pending_inv2_only=1,
+                         blobs_per_second=None, bytes_per_second=None, eta_seconds=None,
+                         last_batch_finished_at=None)
+        include_automatic = True
+        console = self.master.console
+
+        def with_automatic(command):
+            response = console(command)
+            if command == 'stats' or command.startswith('restore-preview '):
+                data = json.loads(response)
+                data.pop('automatic', None)
+                if include_automatic:
+                    data['automatic'] = automatic
+                response = json.dumps(data)
+            return response
+
+        with patch.object(self.master, 'console', side_effect=with_automatic):
+            app = self.app()
+            async with app.run_test(size=(80, 24)) as pilot:
+                await self.settle(app, pilot)
+                await self.tab(app, pilot, 'restore')
+                app.query_one('#restore-category', Select).value = 'inv2_candidate'
+                await self.settle(app, pilot)
+                progress = app.query_one('#restore-progress', Static)
+                self.assertIn('Success rate (last 5m): — · — · ETA (eligible queue): —', str(progress.content))
+                self.assertIn('Last batch: never', str(progress.content))
+                self.assertLessEqual(progress.region.bottom, app.query_one('#command', Input).region.y)
+                self.assertGreaterEqual(progress.region.height, 2)
+                self.assertTrue(app.query_one('#restore-start', Button).disabled)
+                automatic.update(enabled=False, state='disabled')
+                app.action_refresh()
+                await self.settle(app, pilot)
+                self.assertIn('Automatic restore · disabled', str(progress.content))
+                self.assertFalse(app.query_one('#restore-start', Button).disabled)
+                include_automatic = False
+                app.action_refresh()
+                await self.settle(app, pilot)
+                self.assertNotIn('Automatic restore', str(progress.content))
+                self.assertIn('No restore started.', str(progress.content))
+                self.assertFalse(app.query_one('#restore-start', Button).disabled)
+
     async def test_buttons_and_raw_commands(self):
         app = self.app()
         async with app.run_test(size=(100, 30)) as pilot:

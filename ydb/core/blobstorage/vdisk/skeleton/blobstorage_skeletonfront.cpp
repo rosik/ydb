@@ -1149,14 +1149,6 @@ namespace NKikimr {
                         str << "SkeletonFront";
                     }
                     DIV_CLASS("panel-body") {
-                        str << "<form method=\"get\" action=\"../../restore_part\" class=\"form-inline\">"
-                            << "<input type=\"hidden\" name=\"VDiskId\" value=\"" << SelfVDiskId.ToString() << "\">"
-                            << "<label for=\"restore-part\">VRestorePart on this VDisk: </label> "
-                            << "<input id=\"restore-part\" name=\"BlobId\" type=\"text\" size=\"64\" required "
-                            << "placeholder=\"[tablet:gen:step:channel:cookie:blobsize:partid]\"> "
-                            << "<button type=\"submit\" class=\"btn btn-default\">VRestorePart</button>"
-                            << "<p>PartId must be nonzero. Returns JSON when the part is written; "
-                            << "timeout is 30 seconds (optional timeout parameter: 1..300 seconds).</p></form>";
                         DIV_CLASS("row") {
                             // global VDisk state and SkeletonFront State
                             DIV_CLASS("col-md-6") {str << GenerateHtmlStateForGlobalVDiskState(); }
@@ -1839,6 +1831,7 @@ namespace NKikimr {
             auto result = std::make_unique<TEvVRestorePartResult>();
             result->Record.SetStatus(status);
             result->Record.SetErrorReason(errorReason);
+            result->Record.SetResponseOrigin(NKikimrBlobStorage::TEvVRestorePartResult::SKELETON_FRONT);
             const ui32 flags = IEventHandle::MakeFlags(ev->GetChannel(), 0);
             ctx.Send(ev->Sender, result.release(), flags, ev->Cookie);
         }

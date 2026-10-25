@@ -41,6 +41,7 @@ SRCS(
     main.cpp
     mirror3dc.cpp
     mirror3of4.cpp
+    mon_blob_rescue_service.cpp
     mon_restore_part.cpp
     monitoring.cpp
     multiget.cpp
@@ -58,6 +59,7 @@ SRCS(
     sync.cpp
     validation.cpp
     vdisk_malfunction.cpp
+    vrestore_part.cpp
     virtual_group.cpp
     group_size_in_units.cpp
     pdisk_status_flags.cpp
@@ -65,7 +67,6 @@ SRCS(
 )
 
 PEERDIR(
-    library/cpp/json
     ydb/core/base
     ydb/core/blobstorage/dsproxy
     ydb/core/blobstorage/groupinfo

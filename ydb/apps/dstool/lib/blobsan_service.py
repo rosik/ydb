@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 
 import re
+import random
 import shlex
 import shutil
 import socket
@@ -28,6 +29,8 @@ import urllib.request
 import uuid
 
 from ydb.apps.dstool.lib import common, write2x2_report
+from ydb.core.protos import blobstorage_pb2
+from google.protobuf import text_format
 
 
 LOG = logging.getLogger('blobsan-service')
@@ -42,7 +45,7 @@ def encode(value):
 
 
 def has_two_complete_realms(indexes):
-    return sum(all(r * 3 + d in indexes for d in range(3)) for r in range(3)) >= 2
+    return len(complete_realms(indexes)) >= 2
 
 
 def pool_identity(layout):
@@ -154,6 +157,62 @@ def restore_blob(args, layout, blob):
     return 'restored'
 
 
+def complete_realms(coverage):
+    indexes = set(coverage)
+    return [realm for realm in range(3) if all(realm * 3 + domain in indexes for domain in range(3))]
+
+
+def restore_part_request(args, body):
+    """Retain non-2xx bodies: the batch can contain successful item responses."""
+    headers = dict(token_headers(), **{'Content-Type': 'application/x-www-form-urlencoded'})
+    request = urllib.request.Request(viewer_url(args) + '/restore_part', data=body, headers=headers)
+    try:
+        response = urllib.request.urlopen(request, timeout=max(args.request_timeout, args.restore_timeout + 10),
+                                          context=ydb_ssl_context())
+    except urllib.error.HTTPError as exc:
+        response = exc
+    with response:
+        return response.status, response.read(MAX_BODY + 1)
+
+
+def parse_restore_part_response(body, expected):
+    """Keep individually valid protobuf-text rows even in an incomplete response."""
+    if len(body) > MAX_BODY:
+        return {}, 'restore_part response exceeds 128 MiB; saved response is truncated'
+    try:
+        lines = body.decode('utf-8').splitlines()
+    except UnicodeError as exc:
+        return {}, 'Invalid restore_part response encoding: ' + str(exc)
+    results, errors, duplicates = {}, [], set()
+    for line in lines:
+        fields = line.split(maxsplit=2)
+        if len(fields) != 3 or (fields[0], fields[1]) not in expected:
+            errors.append('Unexpected restore_part response row: ' + line[:200])
+            continue
+        key = tuple(fields[:2])
+        if key in results or key in duplicates:
+            results.pop(key, None)
+            duplicates.add(key)
+            errors.append('Duplicate restore_part response row: ' + ' '.join(key))
+            continue
+        try:
+            record = blobstorage_pb2.TEvVRestorePartResult()
+            text_format.Parse(fields[2], record)
+            if not record.HasField('Status'):
+                raise ValueError('response has no Status')
+            descriptor = record.DESCRIPTOR.fields_by_name
+            status = descriptor['Status'].enum_type.values_by_number[record.Status].name
+            origin = descriptor['ResponseOrigin'].enum_type.values_by_number[record.ResponseOrigin].name if (
+                'ResponseOrigin' in descriptor and record.HasField('ResponseOrigin')) else None
+        except Exception as exc:
+            errors.append('Invalid restore_part response row: %s: %s' % (' '.join(key), exc))
+        else:
+            results[key] = dict(status=status, origin=origin, error=record.ErrorReason, raw=line)
+    if results.keys() != expected:
+        errors.append('restore_part response omitted %d valid request rows' % len(expected - results.keys()))
+    return results, '; '.join(errors)[:4000] or None
+
+
 def topology(args):
     """BSC inventory for dynamic groups, whiteboard for static groups."""
     data = common.fetch_base_config_and_storage_pools(cache=False)
@@ -217,6 +276,7 @@ class Master:
         self.db.row_factory = sqlite3.Row
         self.db.executescript('''
             PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=FULL;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS groups(
                 id INTEGER PRIMARY KEY, layout TEXT, seen REAL, due REAL DEFAULT 0,
@@ -237,7 +297,47 @@ class Master:
                 gid INTEGER PRIMARY KEY, generation INTEGER, fingerprint TEXT,
                 started REAL, finished REAL, result TEXT);
             CREATE TABLE IF NOT EXISTS restore_runs(id TEXT PRIMARY KEY, result TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS restore_batches(
+                id TEXT PRIMARY KEY, started REAL NOT NULL, finished REAL, state TEXT NOT NULL,
+                request BLOB NOT NULL, http_status INTEGER, response BLOB, error TEXT,
+                blob_count INTEGER NOT NULL, request_count INTEGER NOT NULL,
+                successful_blobs INTEGER NOT NULL DEFAULT 0, successful_bytes INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX IF NOT EXISTS restore_batches_finished ON restore_batches(finished);
+            CREATE INDEX IF NOT EXISTS restore_batches_state ON restore_batches(state,started);
+            CREATE TABLE IF NOT EXISTS restore_attempts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, batch_id TEXT NOT NULL, gid INTEGER NOT NULL,
+                blob TEXT NOT NULL, category TEXT NOT NULL, generation INTEGER, fingerprint TEXT,
+                scan_started REAL NOT NULL, started REAL NOT NULL, finished REAL, state TEXT NOT NULL,
+                logical_bytes INTEGER NOT NULL, error TEXT);
+            CREATE INDEX IF NOT EXISTS restore_attempts_batch ON restore_attempts(batch_id);
+            CREATE INDEX IF NOT EXISTS restore_attempts_finished ON restore_attempts(finished,category);
+            CREATE TABLE IF NOT EXISTS restore_requests(
+                attempt_id INTEGER NOT NULL, vdisk TEXT NOT NULL, status TEXT, origin TEXT, error TEXT, raw TEXT,
+                PRIMARY KEY(attempt_id,vdisk));
+            CREATE TABLE IF NOT EXISTS auto_restore_work(
+                gid INTEGER, blob TEXT, attempt_id INTEGER NOT NULL, PRIMARY KEY(gid,blob));
         ''')
+        self.db.execute('BEGIN')
+        group_columns = {row['name'] for row in self.db.execute('PRAGMA table_info(groups)')}
+        if 'claimed_at' not in group_columns:
+            self.db.execute('ALTER TABLE groups ADD COLUMN claimed_at REAL NOT NULL DEFAULT 0')
+        columns = {row['name'] for row in self.db.execute('PRAGMA table_info(restore_candidates)')}
+        if 'scan_started' not in columns:
+            self.db.execute('ALTER TABLE restore_candidates ADD COLUMN scan_started REAL NOT NULL DEFAULT 0')
+        if 'realm_mask' not in columns:
+            self.db.execute('ALTER TABLE restore_candidates ADD COLUMN realm_mask INTEGER NOT NULL DEFAULT 0')
+            for row in self.db.execute('SELECT gid,category,blob,coverage FROM restore_candidates'):
+                mask = sum(1 << realm for realm in complete_realms(json.loads(row['coverage'])))
+                self.db.execute('UPDATE restore_candidates SET realm_mask=? WHERE gid=? AND category=? AND blob=?',
+                                (mask, row['gid'], row['category'], row['blob']))
+        now = time.time()
+        interrupted = 'Master restarted before outcome was recorded; a fresh scan is required before retrying'
+        self.db.execute("UPDATE restore_batches SET state='unknown',finished=?,error=? WHERE state='inflight'",
+                        (now, interrupted))
+        self.db.execute("""UPDATE restore_requests SET status='UNKNOWN',error=? WHERE attempt_id IN
+            (SELECT id FROM restore_attempts WHERE state='inflight') AND status IS NULL""", (interrupted,))
+        self.db.execute("UPDATE restore_attempts SET state='unknown',finished=?,error=? WHERE state='inflight'",
+                        (now, interrupted))
         for key, value in [('paused', 0), ('interval', args.interval), ('retry', args.retry)]:
             self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', (key, str(value)))
         self.db.commit()
@@ -304,8 +404,8 @@ class Master:
                     if busy.intersection(s['node'] for s in layout['slots']):
                         continue
                     lease = uuid.uuid4().hex
-                    self.db.execute('UPDATE groups SET token=?,owner=?,expires=? WHERE id=?',
-                                    (lease, worker, now + self.args.lease, row['id']))
+                    self.db.execute('UPDATE groups SET token=?,owner=?,expires=?,claimed_at=? WHERE id=?',
+                                    (lease, worker, now + self.args.lease, now, row['id']))
                     return {'job': dict(layout=layout, token=lease, lease_seconds=self.args.lease)}
                 return {'job': None}
             gid, lease = int(body['group']), body['token']
@@ -359,14 +459,18 @@ class Master:
                 self.db.executemany('UPDATE restore_candidates SET active=0 WHERE gid=? AND category=? AND blob=?',
                                     ((gid, category, blob) for category, blob in resolved))
                 coverage = json.dumps(sorted(completed))
+                # Compare master-owned lease times; worker clocks can differ.
+                scan_started = row['claimed_at']
+                realm_mask = sum(1 << realm for realm in complete_realms(completed))
                 layout = json.loads(row['layout'])
                 self.db.executemany(
                     '''INSERT INTO restore_candidates
-                    (gid,category,blob,first_seen,last_seen,active,coverage,generation,fingerprint)
-                    VALUES(?,?,?,?,?,1,?,?,?) ON CONFLICT(gid,category,blob) DO UPDATE SET
+                    (gid,category,blob,first_seen,last_seen,active,coverage,generation,fingerprint,scan_started,realm_mask)
+                    VALUES(?,?,?,?,?,1,?,?,?,?,?) ON CONFLICT(gid,category,blob) DO UPDATE SET
                     last_seen=excluded.last_seen,active=1,coverage=excluded.coverage,
-                    generation=excluded.generation,fingerprint=excluded.fingerprint''',
-                    ((gid, category, blob, now, now, coverage, layout['generation'], layout['fingerprint'])
+                    generation=excluded.generation,fingerprint=excluded.fingerprint,
+                    scan_started=excluded.scan_started,realm_mask=excluded.realm_mask''',
+                    ((gid, category, blob, now, now, coverage, layout['generation'], layout['fingerprint'], scan_started, realm_mask)
                      for category, blob in current))
                 previous_blobs = {blob for _, blob in previous}
                 current_blobs = {blob for _, blob in current}
@@ -481,6 +585,218 @@ class Master:
             items.append(item)
         return dict(category=category, group=gid, offset=offset, limit=limit, total=total, rows=items)
 
+    def automatic_queue(self, now):
+        # A retained inv1 observation can have obsolete layout/coverage while the
+        # same blob has a fresh inv2 observation. Apply the shared attempt gate
+        # before choosing one observation, then prefer inv1 at equal readiness.
+        # Rank only keys/state in SQLite; do not materialize all layouts in Python.
+        return '''WITH observations AS (
+            SELECT c.gid,c.blob,c.category,CASE
+                WHEN a.state='inflight' THEN 'inflight'
+                WHEN c.generation IS NULL OR c.fingerprint IS NULL OR g.seen<:fresh
+                    OR c.generation!=json_extract(g.layout,'$.generation')
+                    OR c.fingerprint!=json_extract(g.layout,'$.fingerprint')
+                    OR c.realm_mask NOT IN (3,5,6,7) THEN 'excluded'
+                WHEN a.id IS NULL THEN 'pending'
+                WHEN c.scan_started<=a.finished THEN CASE WHEN a.state='awaiting_rescan'
+                    THEN 'awaiting_rescan' WHEN a.state='unknown' THEN 'unknown' ELSE 'retry_wait' END
+                WHEN a.finished+:retry>:now THEN 'retry_wait'
+                ELSE 'pending' END queue_state
+            FROM restore_candidates c JOIN groups g ON g.id=c.gid
+            LEFT JOIN auto_restore_work w ON w.gid=c.gid AND w.blob=c.blob
+            LEFT JOIN restore_attempts a ON a.id=w.attempt_id
+            WHERE c.active=1
+        ), ranked AS (
+            SELECT *,row_number() OVER (PARTITION BY gid,blob ORDER BY
+                CASE queue_state WHEN 'pending' THEN 0 WHEN 'inflight' THEN 0
+                    WHEN 'retry_wait' THEN 1 WHEN 'excluded' THEN 3 ELSE 2 END,
+                CASE category WHEN 'inv1_candidate' THEN 0 ELSE 1 END) preference
+            FROM observations
+        ), queue AS (
+            SELECT c.*,g.layout,g.seen,r.queue_state
+            FROM ranked r JOIN restore_candidates c ON c.gid=r.gid AND c.blob=r.blob AND c.category=r.category
+            JOIN groups g ON g.id=c.gid WHERE r.preference=1
+        ) ''', dict(now=now, fresh=now - self.args.refresh * 2, retry=self.setting('retry'))
+
+    def automatic_status(self):
+        now = time.time()
+        prefix, params = self.automatic_queue(now)
+        rows = self.db.execute(prefix + 'SELECT queue_state,category,count(*) n FROM queue GROUP BY queue_state,category', params)
+        result = dict(enabled=bool(getattr(self.args, 'restore', False)), state='disabled', pending_inv1=0,
+                      pending_inv2_only=0, inflight_blobs=0, awaiting_rescan=0, retry_wait=0, unknown_outcomes=0,
+                      excluded_blobs=0, active_unique_blobs=0, completed_blobs=0, completed_bytes=0,
+                      blobs_per_second=0.0, bytes_per_second=0.0, eta_seconds=None,
+                      last_batch_finished_at=None, status_counts={}, errors=[], current_batch=None, phase_rates={})
+        names = dict(inflight='inflight_blobs', awaiting_rescan='awaiting_rescan', retry_wait='retry_wait',
+                     unknown='unknown_outcomes', excluded='excluded_blobs')
+        for row in rows:
+            result['active_unique_blobs'] += row['n']
+            key = ('pending_inv1' if row['category'] == 'inv1_candidate' else 'pending_inv2_only') if (
+                row['queue_state'] == 'pending') else names[row['queue_state']]
+            result[key] += row['n']
+        total = self.db.execute('''SELECT coalesce(sum(successful_blobs),0),coalesce(sum(successful_bytes),0),
+            max(finished) FROM restore_batches''').fetchone()
+        result.update(completed_blobs=total[0], completed_bytes=total[1], last_batch_finished_at=total[2])
+        recent = self.db.execute('''SELECT min(started),sum(successful_blobs),sum(successful_bytes)
+            FROM restore_batches WHERE finished>=?''', (now - 300,)).fetchone()
+        if recent[0] is not None:
+            elapsed = max(1.0, now - max(now - 300, recent[0]))
+            result.update(blobs_per_second=(recent[1] or 0) / elapsed, bytes_per_second=(recent[2] or 0) / elapsed)
+        pending = result['pending_inv1'] + result['pending_inv2_only']
+        for category, phase, key in (('inv1_candidate', 'inv1', 'pending_inv1'),
+                                     ('inv2_candidate', 'inv2_only', 'pending_inv2_only')):
+            recent_phase = self.db.execute('''SELECT min(started),count(*),sum(logical_bytes)
+                FROM restore_attempts WHERE finished>=? AND category=? AND state='awaiting_rescan' ''',
+                                           (now - 300, category)).fetchone()
+            elapsed = max(1.0, now - max(now - 300, recent_phase[0])) if recent_phase[0] is not None else 1.0
+            rate = recent_phase[1] / elapsed
+            result['phase_rates'][phase] = dict(
+                pending=result[key], blobs_per_second=rate,
+                bytes_per_second=(recent_phase[2] or 0) / elapsed,
+                eta_seconds=result[key] / rate if rate else None if result[key] else 0)
+        estimates = [phase['eta_seconds'] for phase in result['phase_rates'].values()]
+        if all(value is not None for value in estimates) and (pending or result['blobs_per_second']):
+            result['eta_seconds'] = sum(estimates)
+        current = self.db.execute('''SELECT id,blob_count blobs,request_count requests,started started_at
+            FROM restore_batches WHERE state='inflight' ORDER BY started DESC LIMIT 1''').fetchone()
+        result['current_batch'] = dict(current) if current else None
+        result['status_counts'] = dict(self.db.execute('''SELECT coalesce(r.status,'UNKNOWN'),count(*)
+            FROM restore_requests r JOIN restore_attempts a ON a.id=r.attempt_id
+            JOIN restore_batches b ON b.id=a.batch_id WHERE b.finished>=? GROUP BY r.status''', (now - 300,)))
+        errors = self.db.execute('''SELECT a.gid,a.blob,r.vdisk,r.status,r.origin,r.error
+            FROM restore_requests r JOIN restore_attempts a ON a.id=r.attempt_id
+            WHERE a.id IN (SELECT id FROM restore_attempts ORDER BY id DESC LIMIT 1000)
+                AND r.error IS NOT NULL AND r.error!=''
+            ORDER BY a.id DESC LIMIT 20''')
+        result['errors'] = [dict(row) for row in errors]
+        if result['enabled']:
+            result['state'] = (
+                'paused' if self.setting('paused') else
+                'running' if current else
+                'ready' if pending else 'waiting_for_scan')
+        return result
+
+    def prepare_automatic_batch(self):
+        now = time.time()
+        with self.lock, self.db:
+            if STOP.is_set() or self.setting('paused') or not getattr(self.args, 'restore', False):
+                return None
+            if self.db.execute("SELECT 1 FROM restore_batches WHERE state='inflight'").fetchone():
+                return None
+            prefix, params = self.automatic_queue(now)
+            rows = self.db.execute(prefix + '''SELECT * FROM queue WHERE queue_state='pending'
+                ORDER BY CASE category WHEN 'inv1_candidate' THEN 0 ELSE 1 END,random() LIMIT 500''', params).fetchall()
+            if not rows:
+                return None
+            batch_id = uuid.uuid4().hex
+            items, lines = [], []
+            for row in rows:
+                layout = json.loads(row['layout'])
+                slots = {slot['index'] for slot in layout['slots']}
+                count = 1 if row['category'] == 'inv1_candidate' else 2
+                targets = []
+                for realm in range(3):
+                    if row['realm_mask'] & (1 << realm):
+                        indexes = [realm * 3 + domain for domain in range(3)]
+                        if not set(indexes).issubset(slots):
+                            raise ValueError('Incomplete group layout for restoration')
+                        targets.extend(random.sample(indexes, count))
+                random.shuffle(targets)
+                requests = ['[%x:%d:%d:%d:0]' % (row['gid'], row['generation'], index // 3, index % 3)
+                            for index in targets]
+                items.append((row, requests))
+                lines.extend(vdisk + ' ' + row['blob'] for vdisk in requests)
+            random.shuffle(lines)
+            body = urllib.parse.urlencode(dict(
+                requests='\n'.join(lines), inflight=self.args.restore_inflight,
+                timeout=self.args.restore_timeout)).encode()
+            self.db.execute('''INSERT INTO restore_batches
+                (id,started,state,request,blob_count,request_count) VALUES(?,?,'inflight',?,?,?)''',
+                            (batch_id, now, body, len(items), len(lines)))
+            for row, requests in items:
+                attempt = self.db.execute(
+                    '''INSERT INTO restore_attempts
+                    (batch_id,gid,blob,category,generation,fingerprint,scan_started,started,state,logical_bytes)
+                    VALUES(?,?,?,?,?,?,?,?,'inflight',?)''',
+                    (batch_id, row['gid'], row['blob'], row['category'],
+                     row['generation'], row['fingerprint'], row['scan_started'], now, blob_size(row['blob']))).lastrowid
+                self.db.execute('''INSERT INTO auto_restore_work VALUES(?,?,?) ON CONFLICT(gid,blob)
+                    DO UPDATE SET attempt_id=excluded.attempt_id''', (row['gid'], row['blob'], attempt))
+                self.db.executemany('INSERT INTO restore_requests(attempt_id,vdisk) VALUES(?,?)',
+                                    ((attempt, vdisk) for vdisk in requests))
+            return batch_id, body
+
+    def finish_automatic_batch(self, batch_id, status=None, body=None, error=None, sent=True):
+        finished = time.time()
+        # Save the exact HTTP response before parsing. A parser failure must not
+        # erase evidence of partial success, and a crash must retain the response.
+        with self.lock, self.db:
+            self.db.execute('UPDATE restore_batches SET http_status=?,response=?,error=? WHERE id=?',
+                            (status, body, error, batch_id))
+            requests = self.db.execute(
+                '''SELECT a.id,a.gid,a.blob,a.logical_bytes,r.vdisk
+                FROM restore_attempts a JOIN restore_requests r ON r.attempt_id=a.id WHERE a.batch_id=?''',
+                (batch_id,)).fetchall()
+        parsed = {}
+        if body is not None:
+            try:
+                parsed, parse_error = parse_restore_part_response(body, {(r['vdisk'], r['blob']) for r in requests})
+                error = parse_error or error
+            except Exception as exc:
+                error = 'Cannot parse restore_part response: ' + str(exc)
+        success, successful_bytes = 0, 0
+        with self.lock, self.db:
+            outcomes = {}
+            for row in requests:
+                value = parsed.get((row['vdisk'], row['blob']))
+                if value is None:
+                    value = dict(status='UNKNOWN' if sent else 'NOT_SENT', origin=None,
+                                 error=error or 'No response received', raw=None)
+                self.db.execute('''UPDATE restore_requests SET status=?,origin=?,error=?,raw=?
+                    WHERE attempt_id=? AND vdisk=?''',
+                                (value['status'], value['origin'], value['error'], value['raw'], row['id'], row['vdisk']))
+                outcomes.setdefault(row['id'], (row, []))[1].append(value['status'])
+            for attempt, (row, statuses) in outcomes.items():
+                good = all(value in ('OK', 'ALREADY') for value in statuses)
+                state = 'awaiting_rescan' if good else 'unknown' if 'UNKNOWN' in statuses else 'retry_wait'
+                self.db.execute('UPDATE restore_attempts SET finished=?,state=?,error=? WHERE id=?',
+                                (finished, state, error, attempt))
+                success += good
+                successful_bytes += row['logical_bytes'] if good else 0
+            self.db.execute('''UPDATE restore_batches SET finished=?,state=?,error=?,successful_blobs=?,successful_bytes=?
+                WHERE id=?''', (finished, 'completed' if parsed and not error else 'partial' if parsed else 'unknown' if sent else 'cancelled',
+                                error, success, successful_bytes, batch_id))
+            # Preserve the age of an already queued rescan so frequent restores
+            # in smaller group IDs cannot starve groups that have waited longer.
+            self.db.executemany('UPDATE groups SET due=min(due,?) WHERE id=?',
+                                ((finished, gid) for gid in {r['gid'] for r in requests}))
+        LOG.info('Automatic restore batch %s: %d/%d blobs successful; HTTP %s',
+                 batch_id, success, len(outcomes), status)
+
+    def run_automatic_restore(self):
+        while not STOP.is_set():
+            try:
+                batch = self.prepare_automatic_batch()
+                if batch is None:
+                    STOP.wait(1)
+                    continue
+                batch_id, body = batch
+                if STOP.is_set():
+                    self.finish_automatic_batch(batch_id, error='Master stopped before sending', sent=False)
+                    break
+                try:
+                    status, response = restore_part_request(self.args, body)
+                except Exception as exc:
+                    self.finish_automatic_batch(batch_id, error=str(exc))
+                    log_failure('Automatic restore batch %s failed', exc, batch_id)
+                else:
+                    self.finish_automatic_batch(batch_id, status, response)
+            except Exception:
+                LOG.exception('Automatic restore scheduler failed')
+                with self.lock:
+                    retry = self.setting('retry')
+                STOP.wait(retry)
+
     def restore_status(self):
         row = self.db.execute('SELECT result FROM restore_runs ORDER BY rowid DESC LIMIT 1').fetchone()
         return json.loads(row[0]) if row else None
@@ -524,6 +840,8 @@ class Master:
         return preview, plan
 
     def start_restore(self, words):
+        if getattr(self.args, 'restore', False):
+            raise ValueError('Automatic restoration is enabled; manual restore is unavailable')
         if len(words) != 3:
             raise ValueError('Use restore CATEGORY GROUP|all PREVIEW_TOKEN')
         previous = self.restore_status()
@@ -619,7 +937,7 @@ class Master:
                 return json.dumps(self.candidates(words[1:]))
             elif op == 'restore-preview':
                 preview, _ = self.restore_plan(words[1:])
-                return json.dumps(dict(preview, run=self.restore_status()))
+                return json.dumps(dict(preview, run=self.restore_status(), automatic=self.automatic_status()))
             elif op == 'restore-status':
                 return json.dumps(self.restore_status())
             elif op == 'restore':
@@ -650,6 +968,7 @@ class Master:
                     for r in self.db.execute('SELECT last_result FROM groups WHERE last_result IS NOT NULL'))
                 if stats['oldest_scan'] is not None:
                     stats['oldest_scan_age_seconds'] = round(now - stats.pop('oldest_scan'))
+                stats['automatic'] = self.automatic_status()
                 return json.dumps(stats, indent=2)
             elif op in ('groups', 'workers', 'findings'):
                 if op == 'groups':
@@ -753,6 +1072,10 @@ def serve(args, directory):
     path.chmod(0o777)
     for target in (server.serve_forever, console.serve_forever, master.discover):
         threading.Thread(target=target, daemon=True).start()
+    automatic_thread = None
+    if args.restore:
+        automatic_thread = threading.Thread(target=master.run_automatic_restore, daemon=True)
+        automatic_thread.start()
     LOG.info('Master listening on %s:%d; console %s', args.bind, args.listen, path)
     try:
         STOP.wait()
@@ -763,6 +1086,8 @@ def serve(args, directory):
         server.server_close()
         console.server_close()
         path.unlink(missing_ok=True)
+        if automatic_thread is not None:
+            automatic_thread.join(max(args.request_timeout, args.restore_timeout + 10) + 5)
 
 
 def check_running(cancel):

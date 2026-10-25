@@ -55,6 +55,61 @@ def json_rows(response):
     return [] if response == '(empty)' else [json.loads(line) for line in response.splitlines()]
 
 
+def restore_rate(automatic):
+    value = automatic.get('blobs_per_second')
+    return '—' if value is None else f'{value:,.1f} blobs/s'
+
+
+def restore_eta(automatic):
+    value = automatic.get('eta_seconds')
+    return '—' if value is None else age(value)
+
+
+def automatic_restore_progress(automatic):
+    state = automatic.get('state', 'enabled' if automatic.get('enabled') else 'disabled')
+    inv1 = automatic.get('pending_inv1', 0)
+    inv2 = automatic.get('pending_inv2_only', 0)
+    byte_rate = automatic.get('bytes_per_second')
+    byte_rate = '—' if byte_rate is None else size(byte_rate) + '/s'
+    last_batch = automatic.get('last_batch_finished_at')
+    last_batch = since(last_batch) + ' ago' if last_batch is not None else 'never'
+    lines = [
+        f'Automatic restore · {state} · all groups · inv1 first',
+        f'Remaining eligible: {inv1 + inv2:,} blobs · inv1: {inv1:,} · inv2 only: {inv2:,}',
+        f"In flight: {automatic.get('inflight_blobs', 0):,} · "
+        f"Awaiting rescan: {automatic.get('awaiting_rescan', 0):,} · "
+        f"Retry wait: {automatic.get('retry_wait', 0):,}",
+        f"Unknown outcomes: {automatic.get('unknown_outcomes', 0):,} · "
+        f"Excluded (outdated / stale): {automatic.get('excluded_blobs', 0):,} · "
+        f"Active candidates: {automatic.get('active_unique_blobs', 0):,}",
+        f'Success rate (last 5m): {restore_rate(automatic)} · {byte_rate} · ETA (eligible queue): {restore_eta(automatic)}',
+        f"Successful blob attempts: {automatic.get('completed_blobs', 0):,} "
+        f"({size(automatic.get('completed_bytes', 0))}) · "
+        f'Last batch: {last_batch}',
+        'Successful attempts await scan verification; a blob may need another attempt. New discoveries change the ETA.',
+    ]
+    phases = automatic.get('phase_rates') or {}
+    if phases:
+        lines.insert(5, 'Phase rates (last 5m): ' + ' · '.join(
+            f'{label}: {restore_rate(phases[key])}, ETA {restore_eta(phases[key])}'
+            for key, label in (('inv1', 'inv1'), ('inv2_only', 'inv2 only')) if key in phases))
+    batch = automatic.get('current_batch')
+    if batch:
+        lines.append(f"Batch {batch['id']}: {batch['blobs']:,} blobs · {batch['requests']:,} VDisk requests · "
+                     f"running {since(batch['started_at'])}")
+    counts = automatic.get('status_counts') or {}
+    if counts:
+        lines.append('VDisk responses (last 5m): ' + ' · '.join(f'{status}: {count:,}' for status, count in sorted(counts.items())))
+    for error in automatic.get('errors') or []:
+        context = ' · '.join(
+            label + str(error[key])
+            for key, label in (
+                ('gid', 'Group '), ('blob', 'BlobId '), ('vdisk', 'VDiskId '), ('status', ''), ('origin', ''))
+            if error.get(key) is not None)
+        lines.append((context + ': ' if context else '') + str(error.get('error', 'Unknown restore error')))
+    return '\n'.join(lines)
+
+
 class ConsoleApp(App):
     TITLE = 'blobsan-service'
     BINDINGS = [
@@ -246,9 +301,11 @@ class ConsoleApp(App):
         self.query_one('#candidate-next', Button).disabled = (
             not self._connected or self._candidate_offset + 1000 >= self._candidate_total)
         preview = self._restore_preview
+        automatic = (preview or {}).get('automatic') or self.stats.get('automatic') or {}
         self.query_one('#restore-preview', Button).disabled = not self._connected or self._command_busy
         self.query_one('#restore-start', Button).disabled = (
             not self._connected or self._command_busy or not preview or not preview['blobs']
+            or automatic.get('enabled', False)
             or (preview['run'] is not None and preview['run']['state'] == 'running'))
 
     def _table(self, name, rows):
@@ -283,8 +340,14 @@ class ConsoleApp(App):
         try:
             self.stats = json.loads(await self.connection.request('stats'))
             s = self.stats
+            automatic = s.get('automatic')
+            restore_summary = ''
+            if automatic and automatic.get('enabled'):
+                restore_summary = (f"Auto restore {automatic['state']} · inv1 {automatic['pending_inv1']:,} · "
+                                   f"inv2 only {automatic['pending_inv2_only']:,} · {restore_rate(automatic)} · "
+                                   f"ETA {restore_eta(automatic)}\n")
             self.query_one('#summary', Static).update(
-                f"{'PAUSED' if str(s.get('paused')) == '1' else 'RUNNING'}  "
+                restore_summary + f"{'PAUSED' if str(s.get('paused')) == '1' else 'RUNNING'}  "
                 f"Groups: {s.get('groups', 0)}  Busy: {s.get('busy') or 0}  "
                 f"Workers: {s.get('workers_alive', 0)}  Scans: {s.get('scans') or 0}  "
                 f"Failed: {s.get('failed') or 0}  Candidates: {s.get('unresolved_candidates', 0)}  "
@@ -368,6 +431,9 @@ class ConsoleApp(App):
                     progress += '\n' + run['error']
                 for error in run['errors']:
                     progress += f"\nGroup {error['gid']} {error['blob']}: {error['error']}"
+            automatic = data.get('automatic')
+            if automatic:
+                progress = automatic_restore_progress(automatic) + '\n\nManual restore\n' + progress
             self.query_one('#restore-progress', Static).update(progress)
             self._update_buttons()
 

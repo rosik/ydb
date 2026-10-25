@@ -4,6 +4,8 @@
 VDisk metadata, and collects restore candidate BlobIds on a master. Workers
 run `blobsan` once per snapshot with `--restore-canidates` to collect both
 `inv1_candidate` and `inv2_candidate`. Workers issue no blob repair requests.
+With `master --restore`, the master continuously restores candidates through
+`POST /restore_part`, prioritizing `inv1_candidate`.
 
 `MinRedundancyPerDc` is the minimum observed replica count across fully captured
 datacenters, ignoring `?` realms. Eligible, restorable blobs enter `inv1_candidate` when
@@ -24,16 +26,34 @@ Every successful scan also produces a histogram of all observed blobs before
 candidate filtering, including complete layouts and GC metadata. Scans with
 insufficient candidate coverage still publish their histogram.
 
+## Architecture
+
+![BlobSan service on two cluster nodes: client connects to master by Unix socket;
+master persists candidates and repair attempts in SQLite, coordinates workers
+by HTTP and calls ydbd POST /restore_part; each worker streams group-wide VDisk
+metadata and runs its local blobsan process.](blobsan-service-architecture.svg)
+
+The diagram shows two representative cluster nodes. A `mirror-3-dc` group has
+three realms and nine VDisks; a worker streams all available VDisks of its
+assigned group, including VDisks on other hosts. `blobsan` runs locally as a
+worker subprocess. The master alone owns the candidate database and issues
+automatic repair requests. The client connects to the master's Unix socket
+and can disconnect without interrupting scans or restoration.
+
 ## Start
 
 ```bash
 dstool --token-file ~/.token blobsan-service master \
-    -l 22570 --db ~/blobsan_master_db/ --console-sock /tmp/blobsan.sock
+    -l 22570 --db ~/blobsan_master_db/ --console-sock /tmp/blobsan.sock --restore
 
 # On each selected storage host:
 dstool --token-file ~/.token blobsan-service worker \
     --master master-host:22570 --db ~/blobsan_worker_db/ --blobsan ~/blobsan
 ```
+
+Omit `master --restore` to collect candidates without automatic repair.
+The `ydbd` monitoring endpoint used by the master must support
+`POST /restore_part` when automatic restoration is enabled.
 
 For this command only, an omitted `-e` defaults to `localhost`. Every process
 uses its own endpoint and credentials. All workers must point to the same
@@ -69,6 +89,91 @@ Rebuild both binaries when changing analyzer protocols. The previous
 `--write2x2-candidates`, `worker --scan-only` and `worker --repair-delay` options
 are no longer used.
 
+## Automatic restoration
+
+`master --restore` starts a background scheduler using the existing persistent
+`inv1_candidate` and `inv2_candidate` lists. Each batch contains at most 500
+distinct `(group, BlobId)` pairs. The master chooses eligible `inv1_candidate`
+entries first, then fills remaining space with `inv2_candidate` entries that
+have no eligible `inv1_candidate` observation. A retained older observation
+does not hide a fresh eligible observation in the other category. Selection
+is random across all groups within each priority, and the request lines are
+shuffled to spread load.
+
+Candidates must match fresh group inventory and its generation and topology.
+Their observation must cover at least two complete realms; a complete realm
+has all three VDisk streams captured. For each complete realm, the master
+chooses one random VDisk for `inv1_candidate`, or two distinct random VDisks
+for `inv2_candidate`. It submits full BlobIds with PartId 0. Thus a batch of
+500 blobs can contain up to 3000 target VDisk requests.
+
+The master uses its own Viewer URL and credentials to send one
+`application/x-www-form-urlencoded` `POST /restore_part` with `requests`,
+`inflight` and `timeout`. Only one HTTP batch runs at a time.
+`--restore-inflight` limits concurrent target VDisk requests within the batch
+(default 16). `--restore-timeout` sets the server deadline in seconds
+(default 60, maximum 300). The HTTP deadline is at least ten seconds longer
+than the server deadline and at least `--request-timeout`.
+
+Before sending, the master commits the exact request and selected candidates
+to SQLite. It retains the HTTP status and raw response, including non-2xx
+responses, before interpreting per-VDisk `Status`, `ResponseOrigin` and `ErrorReason`.
+`restore_batches` stores each HTTP exchange, `restore_attempts` preserves the
+history of per-blob attempts, and `restore_requests` stores their per-VDisk
+outcomes. `auto_restore_work` points to the latest attempt; another attempt
+never overwrites a previous attempt. Network calls run outside the database
+lock, so workers can continue reporting scans and the client remains usable.
+
+A blob enters `awaiting_rescan` only when every selected target returned `OK`
+or `ALREADY`. Known failures enter `retry_wait`; an unrecorded, malformed or
+missing outcome enters `unknown`. Restarting the master marks interrupted
+attempts unknown. Every attempted blob must have a new scan whose **lease was
+issued after its attempt finished**, and the retry delay must elapse before
+it can be selected again. This gate uses `groups.claimed_at`, recorded by the
+master when assigning the scan and copied into the candidate's `scan_started`.
+Worker wall-clock timestamps are diagnostic only and do not control retries.
+A completed batch schedules its groups for scanning. Repeated restoration in
+one group does not move its rescan ahead of groups already waiting.
+Candidates remain active until the analyzer's later observations remove them;
+successful HTTP responses alone do not prove the desired replica layout.
+
+`pause` stops new scan assignments and new restore batches; operations already
+in progress finish. `resume` restarts both schedulers. SIGINT/SIGTERM allow the
+current HTTP call to finish within its timeout. Manual restoration is disabled
+while `master --restore` is active. To disable automatic restoration, restart
+the master without the flag, keeping the same `--db` directory.
+
+### Progress and completion estimates
+
+The client summary and **Restore** tab show the automatic scheduler state and
+remaining eligible blobs, split into `inv1` and `inv2 only`. The Restore tab
+also shows the current batch, active candidate count, blobs in flight,
+`awaiting_rescan`, `retry_wait`, unknown outcomes, and candidates excluded due
+to stale inventory, changed topology or insufficient coverage. These counts
+refer to distinct `(group, BlobId)` pairs, not the sum of both candidate lists.
+
+The recent rate uses successful per-blob attempts from the last five minutes,
+in blobs/s and logical bytes/s. An attempt counts as successful only when all
+its target VDisk requests returned `OK` or `ALREADY`; repeated successful
+attempts can count the same blob more than once. Cumulative successful totals
+have the same meaning and are not a count of candidates verified as repaired.
+The tab also shows recent per-VDisk status counts and up to 20 latest errors
+with GroupId, BlobId, VDiskId and response origin.
+
+The client also displays separate recent rates and ETAs for `inv1` and
+`inv2 only`. For each phase, ETA divides its **currently eligible pending
+queue** by that phase's successful-attempt rate. The total ETA sums both phase
+estimates; it is unavailable if a phase has pending work but no measured
+nonzero rate. The master does not extrapolate the `inv1` rate to `inv2`.
+
+ETA excludes in-flight requests, rescans, retry delays, unknown outcomes and
+excluded candidates. New scan results can add work or change its priority, so
+ETA estimates the current queue rather than a final cluster completion time.
+Track active candidates and the waiting states alongside ETA to see work that
+still needs observation. The console exposes these fields, including
+`phase_rates.inv1` and `phase_rates.inv2_only`, in the `automatic` object
+returned by `stats` and `restore-preview`.
+
 ## Console and client
 
 The Unix socket is created with mode 0777. Anyone who can access it can run
@@ -97,8 +202,11 @@ group opened from Groups or Candidates. Outdated candidates and stale group
 inventory are excluded and counted separately. **Preview** or **F5** refreshes
 these totals without issuing restoration requests.
 
-**Restore** starts one background job on the master for the previewed selection.
-If the eligible list or group generation changed, refresh the preview before
+With automatic restoration disabled, **Restore** starts one background job
+on the master for the previewed selection. With `master --restore` enabled,
+this button is disabled and the tab displays automatic progress instead.
+For a manual job, if the eligible list or group generation changed, refresh
+the preview before
 starting. The master uses its own endpoint and credentials, verifies each
 group generation, then sends one `/get_blob` request per eligible
 candidate with `groupId`, the full `blob` ID, `mustRestoreFirst=1` and `binary=1`.
@@ -114,12 +222,14 @@ After a job, its groups are scheduled for another scan. Candidate lists remain
 active until scans reevaluate them. A successful MustRestoreFirst request does
 not guarantee that `inv2_candidate` becomes false: `TEvGet` can succeed with one
 replica in each of three realms, or two replicas in each of two realms.
-Automatic scans and workers continue to issue no restoration requests.
+Workers issue no restoration requests; with `master --restore`, the master's
+automatic scheduler uses the separate `/restore_part` workflow described above.
 
 The active view and statistics refresh every five seconds (`client --refresh
 SEC`). **F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses
 the command input, and **Ctrl+Q** exits. Buttons pause/resume assignment,
-schedule all groups and refresh inventory. Raw command responses appear in the
+schedule all groups and refresh inventory. Pause/resume also controls new
+automatic restore batches. Raw command responses appear in the
 Console tab; `quit` exits the client.
 
 After connection loss the client retains displayed data, marks it stale and
@@ -129,16 +239,16 @@ automatically because their effect may already have been applied.
 
 | Command | Effect |
 |---|---|
-| `stats` | Discovery, scan/candidate totals, live workers, stale inventory and missing VDisks |
+| `stats` | Discovery, scan/candidate totals, live workers, stale inventory, missing VDisks and automatic restore progress |
 | `groups` / `groups brief` | Group scan time, candidate count, coverage, owner, scheduling and errors; `brief` includes pool identity/generation and omits full reports |
 | `layouts GROUP` | Latest successful histogram, coverage, stream errors, timestamps, generation and latest attempt error |
 | `pools [POOL]` | Histograms summed over latest group reports; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
 | `workers` | Known workers and last contact timestamps |
 | `candidates CATEGORY [GROUP\|all] [OFFSET] [LIMIT]` | Candidate BlobIds; CATEGORY is `all`, `inv1_candidate` or `inv2_candidate`; default offset 0, limit 1000, maximum limit 1000 |
-| `restore-preview CATEGORY [GROUP\|all]` | Eligible blob count, logical bytes, excluded candidates and a preview token; CATEGORY is `inv1_candidate` or `inv2_candidate` |
-| `restore CATEGORY GROUP\|all PREVIEW_TOKEN` | Start a background restore for the unchanged preview |
-| `restore-status` | Latest restore job progress and up to 20 errors |
-| `pause` / `resume` | Stop/resume assigning new jobs; running jobs finish |
+| `restore-preview CATEGORY [GROUP\|all]` | Eligible blob count, logical bytes, excluded candidates, a preview token and automatic progress; CATEGORY is `inv1_candidate` or `inv2_candidate` |
+| `restore CATEGORY GROUP\|all PREVIEW_TOKEN` | Start a manual background restore for the unchanged preview; unavailable with `master --restore` |
+| `restore-status` | Latest manual restore job progress and up to 20 errors |
+| `pause` / `resume` | Stop/resume new scan assignments and automatic restore batches; running operations finish |
 | `scan [GROUP\|all]` | Make a group/all groups eligible for scanning now |
 | `interval SECONDS` | Set the clean-group rescan interval |
 | `retry SECONDS` | Set the delay after candidates or scan errors |
@@ -164,7 +274,8 @@ request/response framing for other clients.
 One worker scans one group at a time. The master avoids concurrent jobs sharing
 storage nodes. All VDisks of one group can stream concurrently. Master SQLite
 stores topology, leases, schedules, per-category candidate lists and latest
-reports. Workers persist identity and unacknowledged results locally.
+reports, plus automatic repair requests, raw responses and attempt history.
+Workers persist identity and unacknowledged results locally.
 
 Snapshot files for the last job remain in `DB/scan` and are replaced by the
 next job. `snapshot` is the assembled input, `blobsan.err` is analyzer stderr,

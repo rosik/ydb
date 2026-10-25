@@ -16,12 +16,13 @@ namespace {
         TEvVRestorePart::TPtr Ev;
         TLogoBlobID BlobId;
         TInstant Deadline;
+        NMatrix::TVectorType AllowedParts;
 
-        void Reply(NKikimrProto::EReplyStatus status, const TString& error = {}, bool invalidRequest = false) {
+        void Reply(NKikimrProto::EReplyStatus status, const TString& error = {}) {
             auto result = std::make_unique<TEvVRestorePartResult>();
             result->Record.SetStatus(status);
             result->Record.SetErrorReason(error);
-            result->Record.SetInvalidRequest(invalidRequest);
+            result->Record.SetResponseOrigin(NKikimrBlobStorage::TEvVRestorePartResult::VRESTORE_PART_ACTOR);
             Send(Ev->Sender, result.release(), 0, Ev->Cookie);
             PassAway();
         }
@@ -32,8 +33,18 @@ namespace {
                 return Reply(NKikimrProto::ERROR, "Invalid TEvRecoverBlobResult");
             }
             auto& item = items.front();
-            if (item.Status != NKikimrProto::OK) {
+            if (item.Status != NKikimrProto::OK && (BlobId.PartId() || item.Status != NKikimrProto::NODATA)) {
                 return Reply(item.Status, "Failed to recover the requested part");
+            }
+            if (!BlobId.PartId()) {
+                // Select an available eligible part, rather than forcing a particular handoff part.
+                auto available = item.GetAvailableParts();
+                available &= AllowedParts;
+                if (available.Empty()) {
+                    return Reply(item.Status == NKikimrProto::OK ? NKikimrProto::ERROR : item.Status,
+                        "TEvRecoverBlobResult has no eligible part");
+                }
+                BlobId = TLogoBlobID(BlobId, available.FirstPosition() + 1);
             }
             if (!(item.PartsMask & (1u << (BlobId.PartId() - 1)))) {
                 return Reply(NKikimrProto::ERROR, "TEvRecoverBlobResult has no requested part");
@@ -56,6 +67,41 @@ namespace {
             put->IsInternal = true;
             Send(SkeletonId, put.release(), IEventHandle::FlagTrackDelivery);
             Become(&TThis::StateWrite);
+        }
+
+        void Recover() {
+            if (TActivationContext::Now() >= Deadline) {
+                return HandleTimeout();
+            }
+            auto recover = std::make_unique<TEvRecoverBlob>();
+            recover->Deadline = Deadline;
+            recover->IgnoreConnectionQuorum = true;
+            // Ask recovery to reconstruct at most one part. A NODATA result can still contain
+            // another available part suitable for a PartId 0 request.
+            recover->Items.emplace_back(BlobId.FullID(),
+                NMatrix::TVectorType::MakeOneHot(AllowedParts.FirstPosition(), Top->GType.TotalPartCount()),
+                Top->GType, TDiskPart());
+            Send(SkeletonId, recover.release(), IEventHandle::FlagTrackDelivery);
+            Become(&TThis::StateRecover);
+        }
+
+        void Handle(TEvBlobStorage::TEvVGetResult::TPtr ev) {
+            if (TActivationContext::Now() >= Deadline) {
+                return HandleTimeout();
+            }
+            const auto& record = ev->Get()->Record;
+            if (record.GetStatus() != NKikimrProto::OK) {
+                return Reply(record.GetStatus(), "Failed to read local blob parts");
+            }
+            for (const auto& result : record.GetResult()) {
+                const auto id = LogoBlobIDFromLogoBlobID(result.GetBlobID());
+                if (result.GetStatus() == NKikimrProto::OK && id.FullID() == BlobId.FullID() && id.PartId()
+                        && id.PartId() <= Top->GType.TotalPartCount() && AllowedParts.Get(id.PartId() - 1)
+                        && ev->Get()->GetBlobData(result).size() == Top->GType.PartSize(id)) {
+                    return Reply(NKikimrProto::ALREADY);
+                }
+            }
+            Recover();
         }
 
         void Handle(TEvBlobStorage::TEvVPutResult::TPtr ev) {
@@ -100,11 +146,23 @@ namespace {
                 return Reply(NKikimrProto::RACE, "VDiskId does not match this VDisk's current generation or position");
             }
             BlobId = LogoBlobIDFromLogoBlobID(record.GetBlobID());
-            if (!BlobId || !BlobId.BlobSize() || !BlobId.PartId() || BlobId.PartId() > Top->GType.TotalPartCount()) {
-                return Reply(NKikimrProto::ERROR, "Invalid BlobId or PartId for this group", true);
+            if (!BlobId || !BlobId.BlobSize() || BlobId.PartId() > Top->GType.TotalPartCount()) {
+                return Reply(NKikimrProto::ERROR, "Invalid BlobId or PartId for this group");
             }
-            if (!TIngress::CreateIngressWithLocal(Top.get(), TVDiskIdShort(SelfVDiskId), BlobId)) {
-                return Reply(NKikimrProto::ERROR, "This part cannot be stored on this VDisk", true);
+            const ui32 idxInSubgroup = Top->GetIdxInSubgroup(TVDiskIdShort(SelfVDiskId), BlobId.Hash());
+            AllowedParts = NMatrix::TVectorType(0, Top->GType.TotalPartCount());
+            for (ui32 part = 1; part <= Top->GType.TotalPartCount(); ++part) {
+                // Generic ingress permits misplaced mirror-3-dc parts on handoffs, but
+                // DSProxy and the quorum checker only count the part assigned to this realm.
+                if ((!BlobId.PartId() || BlobId.PartId() == part)
+                        && (Top->GType.GetErasure() != TBlobStorageGroupType::ErasureMirror3dc
+                            || part == idxInSubgroup % 3 + 1)
+                        && TIngress::CreateIngressWithLocal(Top.get(), TVDiskIdShort(SelfVDiskId), TLogoBlobID(BlobId, part))) {
+                    AllowedParts.Set(part - 1);
+                }
+            }
+            if (AllowedParts.Empty()) {
+                return Reply(NKikimrProto::ERROR, "This part cannot be stored on this VDisk");
             }
             if (Cfg->BaseInfo.ReadOnly || Cfg->BaseInfo.DonorMode) {
                 return Reply(NKikimrProto::ERROR, "VDisk is in readonly or donor mode");
@@ -113,15 +171,19 @@ namespace {
             if (TActivationContext::Now() >= Deadline) {
                 return HandleTimeout();
             }
-            auto recover = std::make_unique<TEvRecoverBlob>();
-            recover->Deadline = Deadline;
-            recover->IgnoreConnectionQuorum = true;
-            recover->Items.emplace_back(BlobId.FullID(),
-                NMatrix::TVectorType::MakeOneHot(BlobId.PartId() - 1, Top->GType.TotalPartCount()),
-                Top->GType, TDiskPart());
-            Send(SkeletonId, recover.release(), IEventHandle::FlagTrackDelivery);
-            Become(&TThis::StateRecover, Deadline, new TEvents::TEvWakeup);
+            Schedule(Deadline, new TEvents::TEvWakeup);
+            auto get = TEvBlobStorage::TEvVGet::CreateExtremeDataQuery(SelfVDiskId, Deadline,
+                NKikimrBlobStorage::AsyncRead, TEvBlobStorage::TEvVGet::EFlags::None, {}, {BlobId});
+            Send(SkeletonId, get.release(), IEventHandle::FlagTrackDelivery);
+            Become(&TThis::StateRead);
         }
+
+        STRICT_STFUNC(StateRead,
+            hFunc(TEvBlobStorage::TEvVGetResult, Handle);
+            cFunc(TEvents::TSystem::Wakeup, HandleTimeout);
+            cFunc(TEvents::TSystem::Undelivered, HandleUndelivered);
+            cFunc(TEvents::TSystem::Poison, HandlePoison);
+        )
 
         STRICT_STFUNC(StateRecover,
             hFunc(TEvRecoverBlobResult, Handle);

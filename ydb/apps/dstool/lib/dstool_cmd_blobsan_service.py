@@ -34,6 +34,9 @@ def add_options(parser):
     master.add_argument('--retry', type=positive, default=60, help='Rescan candidates/failed groups after this many seconds')
     master.add_argument('--refresh', type=positive, default=300, help='Inventory refresh interval in seconds')
     master.add_argument('--lease', type=positive, default=120)
+    master.add_argument('--restore', action='store_true', help='Restore candidate blobs automatically in the background')
+    master.add_argument('--restore-inflight', type=positive, default=16, help='Maximum simultaneous VDisk repair requests')
+    master.add_argument('--restore-timeout', type=positive, default=60, help='Server repair batch deadline, 1..300 seconds')
     worker = sub.add_parser('worker', help='Scan one group at a time and report restoration candidates')
     worker.add_argument('--master', required=True, help='HOST:PORT or URL of coordinator')
     worker.add_argument('--blobsan', default='~/blobsan', help='Path to blobsan supporting --restore-canidates')
@@ -72,6 +75,10 @@ def do(args):
         raise common.InvalidParameterError(
             common.connection_params.parser, '--listen', args.listen,
             'Port must be in [1, 65535]')
+    if args.blobsan_service_action == 'master' and args.restore_timeout > 300:
+        raise common.InvalidParameterError(
+            common.connection_params.parser, '--restore-timeout', args.restore_timeout,
+            'Timeout must be in [1, 300] seconds')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     directory = Path(args.db).expanduser()
     directory.mkdir(parents=True, exist_ok=True)

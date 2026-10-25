@@ -33,7 +33,8 @@ def layout(gid=1, nodes=None):
 def args(**kwargs):
     values = dict(interval=3600, retry=60, refresh=300, lease=120, viewer='http://localhost:8765',
                   endpoint=['localhost'], request_timeout=5, scan_timeout=30,
-                  master='unused', secret_file=None, poll=1, heartbeat=1)
+                  master='unused', secret_file=None, poll=1, heartbeat=1,
+                  restore=False, restore_inflight=16, restore_timeout=60)
     values.update(kwargs)
     return SimpleNamespace(**values)
 
@@ -934,6 +935,388 @@ class TestWorker(unittest.TestCase):
         svc.STOP.clear()
 
 
+class TestAutomaticRestore(unittest.TestCase):
+    setUp = TestMaster.setUp
+    add_group = TestMaster.add_group
+    claim = TestMaster.claim
+    result = TestMaster.result
+
+    def enable(self):
+        self.master.args.restore = True
+
+    def batch_lines(self, batch):
+        params = svc.urllib.parse.parse_qs(batch[1].decode())
+        return [tuple(line.split()) for line in params['requests'][0].splitlines()]
+
+    def reply(self, batch, failed=None):
+        rows = []
+        for vdisk, blob in reversed(self.batch_lines(batch)):
+            status = 'NODATA' if blob == failed else 'OK'
+            rows.append(f'{vdisk} {blob} Status: {status} ResponseOrigin: VRESTORE_PART_ACTOR'
+                        + (' ErrorReason: "missing\\n\\"part\\""' if blob == failed else ''))
+        return ('\n'.join(rows) + '\n').encode()
+
+    def test_global_random_batch_is_distinct_bounded_and_prioritizes_inv1(self):
+        blobs = [f'[42:7:{step}:3:5:4096:0]' for step in range(1000, 2002)]
+        urgent = blobs[-2:]
+        self.result(self.claim(), dict(inv1_candidate=urgent, inv2_candidate=blobs))
+        self.enable()
+        calls = []
+        self.master.db.create_function('random', 0, lambda: calls.append(None) or -len(calls))
+        batch = self.master.prepare_automatic_batch()
+        records = self.master.db.execute('SELECT blob,category FROM restore_attempts WHERE batch_id=?', (batch[0],)).fetchall()
+        selected = {row['blob'] for row in records}
+        self.assertEqual(len(selected), 500)
+        self.assertEqual(len(records), 500)
+        self.assertTrue(set(urgent).issubset(selected))
+        self.assertEqual(len(calls), len(blobs))  # random ranking covers the full eligible list, not its first 500 rows
+        self.assertEqual(sum(row['category'] == 'inv1_candidate' for row in records), 2)
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.assertEqual(self.master.db.execute('SELECT request FROM restore_batches').fetchone()[0], batch[1])
+
+    def test_fresh_inv2_is_not_hidden_by_retained_inv1_from_old_generation(self):
+        self.assertTrue(self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB]),
+                                    completed=list(range(6)))['accepted'])
+        updated = dict(layout(), generation=2, fingerprint='v2')
+        with patch.object(svc, 'topology', return_value=[updated]), \
+                patch.object(self.master.refresh, 'wait', side_effect=lambda _: svc.STOP.set()):
+            try:
+                self.master.discover()
+            finally:
+                svc.STOP.clear()
+        self.enable()
+        summary = self.master.automatic_status()
+        self.assertEqual((summary['active_unique_blobs'], summary['excluded_blobs']), (1, 1))
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.assertTrue(self.result(self.claim(), dict(inv1_candidate=[], inv2_candidate=[BLOB]),
+                                    completed=list(range(3, 9)))['accepted'])
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 1)
+        summary = self.master.automatic_status()
+        self.assertEqual((summary['active_unique_blobs'], summary['pending_inv1'],
+                          summary['pending_inv2_only'], summary['excluded_blobs']), (1, 0, 1, 0))
+        batch = self.master.prepare_automatic_batch()
+        attempt = self.master.db.execute('SELECT category,generation FROM restore_attempts').fetchone()
+        self.assertEqual(tuple(attempt), ('inv2_candidate', 2))
+        targets = [vdisk.strip('[]').split(':') for vdisk, _ in self.batch_lines(batch)]
+        self.assertEqual(len(targets), 4)
+        self.assertEqual({row[1] for row in targets}, {'2'})
+        self.assertEqual({row[2] for row in targets}, {'1', '2'})
+
+    def test_fresh_inv2_after_unknown_attempt_requires_a_new_master_lease(self):
+        self.assertTrue(self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB]),
+                                    completed=list(range(6)))['accepted'])
+        self.enable()
+        first = self.master.prepare_automatic_batch()
+        self.master.console('scan all')
+        old_scan = self.claim()
+        self.master.finish_automatic_batch(first[0], error='socket timeout')
+        with self.master.db:
+            self.master.db.execute('UPDATE settings SET value=0 WHERE key="retry"')
+        self.assertTrue(self.result(old_scan, dict(inv1_candidate=[], inv2_candidate=[BLOB]),
+                                    completed=list(range(3, 9)))['accepted'])
+        summary = self.master.automatic_status()
+        self.assertEqual(summary['active_unique_blobs'], 1)
+        self.assertEqual(summary['unknown_outcomes'], 1)
+        self.assertEqual(summary['pending_inv1'] + summary['pending_inv2_only'], 0)
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.master.console('scan all')
+        self.assertTrue(self.result(self.claim(), dict(inv1_candidate=[], inv2_candidate=[BLOB]),
+                                    completed=list(range(3, 9)))['accepted'])
+        summary = self.master.automatic_status()
+        self.assertEqual((summary['pending_inv1'], summary['pending_inv2_only'], summary['unknown_outcomes']), (0, 1, 0))
+        self.assertEqual(json.loads(self.master.console('candidates inv1_candidate'))['total'], 1)
+        second = self.master.prepare_automatic_batch()
+        attempt = self.master.db.execute('SELECT category FROM restore_attempts WHERE batch_id=?', (second[0],)).fetchone()
+        self.assertEqual(attempt['category'], 'inv2_candidate')
+        self.assertEqual(len(self.batch_lines(second)), 4)
+        self.assertEqual(self.master.db.execute('SELECT count(*) FROM restore_attempts').fetchone()[0], 2)
+
+    def test_targets_use_only_complete_realms_and_category_replica_count(self):
+        other = '[42:7:259:3:5:4096:0]'
+        self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB, other]), completed=list(range(3, 9)))
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        targets = {}
+        for vdisk, blob in self.batch_lines(batch):
+            fields = vdisk.strip('[]').split(':')
+            self.assertEqual(fields[:2], ['1', '1'])
+            self.assertEqual(fields[4], '0')
+            self.assertIn(fields[2], ('1', '2'))
+            self.assertTrue(blob.endswith(':0]'))
+            targets.setdefault(blob, []).append((fields[2], fields[3]))
+        self.assertEqual(len(targets[BLOB]), 2)
+        self.assertEqual(len(targets[other]), 4)
+        self.assertEqual(len(set(targets[other])), 4)
+        params = svc.urllib.parse.parse_qs(batch[1].decode())
+        self.assertEqual(params['inflight'], ['16'])
+        self.assertEqual(params['timeout'], ['60'])
+
+    def test_non2xx_mixed_results_persist_exact_response_and_do_not_retire_candidates(self):
+        other = '[42:7:259:3:5:8192:0]'
+        self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB, other]))
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        body = self.reply(batch, failed=other)
+        self.master.finish_automatic_batch(batch[0], 404, body)
+        saved = self.master.db.execute('SELECT * FROM restore_batches').fetchone()
+        self.assertEqual((saved['http_status'], saved['response']), (404, body))
+        self.assertEqual((saved['successful_blobs'], saved['successful_bytes']), (1, 4096))
+        records = {row['blob']: row['state'] for row in self.master.db.execute('SELECT blob,state FROM restore_attempts')}
+        self.assertEqual(records, {BLOB: 'awaiting_rescan', other: 'retry_wait'})
+        failures = self.master.db.execute("SELECT * FROM restore_requests WHERE status='NODATA'").fetchall()
+        self.assertTrue(failures)
+        self.assertEqual(failures[0]['error'], 'missing\n"part"')
+        self.assertEqual(failures[0]['origin'], 'VRESTORE_PART_ACTOR')
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 2)
+        self.assertIsNone(self.master.prepare_automatic_batch())
+
+    def test_restore_rescans_do_not_starve_an_older_waiting_group(self):
+        now = time.time()
+        other = '[42:7:259:3:5:4096:0]'
+        with patch.object(svc.time, 'time', return_value=now) as clock:
+            self.add_group(layout(2))
+            self.result(self.claim(), [BLOB])
+            self.result(self.claim(), [BLOB])
+            self.enable()
+            first = self.master.prepare_automatic_batch()
+            clock.return_value = now + 1
+            self.master.finish_automatic_batch(first[0], 200, self.reply(first))
+
+            # Both groups need a rescan; the smaller ID is selected first.
+            clock.return_value = now + 2
+            job = self.claim()
+            self.assertEqual(job['layout']['id'], 1)
+            clock.return_value = now + 3
+            self.result(job, [BLOB, other])
+            second = self.master.prepare_automatic_batch()
+            self.assertEqual([tuple(row) for row in self.master.db.execute(
+                'SELECT gid,blob FROM restore_attempts WHERE batch_id=?', (second[0],))], [(1, other)])
+            clock.return_value = now + 4
+            self.master.finish_automatic_batch(second[0], 200, self.reply(second))
+
+            # A newly restored blob in group 1 must not push its next scan ahead
+            # of group 2, which still waits for the first batch's rescan.
+            clock.return_value = now + 5
+            self.assertEqual(self.claim()['layout']['id'], 2)
+
+    def test_retry_requires_scan_started_after_attempt_not_late_result_receipt(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        candidate = self.master.db.execute('SELECT scan_started,realm_mask FROM restore_candidates').fetchone()
+        self.assertGreater(candidate['scan_started'], 0)
+        self.assertEqual(candidate['realm_mask'], 7)
+        batch = self.master.prepare_automatic_batch()
+        self.master.finish_automatic_batch(batch[0], error='socket timeout')
+        finished = self.master.db.execute('SELECT finished FROM restore_attempts').fetchone()[0]
+        with self.master.db:
+            self.master.db.execute('UPDATE settings SET value=0 WHERE key="retry"')
+            self.master.db.execute('UPDATE restore_candidates SET last_seen=?,scan_started=?', (finished + 100, finished - 10))
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        with self.master.db:
+            self.master.db.execute('UPDATE restore_candidates SET scan_started=?', (finished + 1,))
+        second = self.master.prepare_automatic_batch()
+        self.assertIsNotNone(second)
+        self.assertNotEqual(batch[0], second[0])
+        self.assertEqual(self.master.db.execute('SELECT count(*) FROM restore_attempts').fetchone()[0], 2)
+
+    def test_retry_uses_master_lease_timestamp_despite_worker_clock_skew(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        self.master.console('scan 1')
+        stale_job = self.claim()
+        old_claim = self.master.db.execute('SELECT claimed_at FROM groups').fetchone()[0]
+        self.master.finish_automatic_batch(batch[0], error='socket timeout')
+        finished = self.master.db.execute('SELECT finished FROM restore_attempts').fetchone()[0]
+        self.assertLess(old_claim, finished)
+        future = finished + 3600
+        result = dict(candidates=dict(inv1_candidate=[], inv2_candidate=[BLOB]), candidates_complete=True,
+                      completed_vdisks=list(range(9)), missing_vdisks=[], scan_report=scan_report(),
+                      started_at=future, finished_at=future + 1)
+        self.assertTrue(self.master.rpc('/result', dict(worker='one', group=1, token=stale_job['token'],
+                                                        result=result))['accepted'])
+        with self.master.db:
+            self.master.db.execute('UPDATE settings SET value=0 WHERE key="retry"')
+        self.assertEqual(self.master.db.execute('SELECT scan_started FROM restore_candidates').fetchone()[0], old_claim)
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.master.console('scan 1')
+        self.result(self.claim(), [BLOB])
+        self.assertGreater(self.master.db.execute('SELECT scan_started FROM restore_candidates').fetchone()[0], finished)
+        self.assertIsNotNone(self.master.prepare_automatic_batch())
+
+    def test_restart_preserves_unknown_history_without_replaying_requests(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        self.master.db.close()
+        self.master = svc.Master(args(restore=True), self.directory)
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        row = self.master.db.execute('SELECT * FROM restore_batches').fetchone()
+        self.assertEqual(row['id'], batch[0])
+        self.assertEqual(row['request'], batch[1])
+        self.assertEqual(row['state'], 'unknown')
+        self.assertEqual(self.master.automatic_status()['unknown_outcomes'], 1)
+        self.assertTrue(all(row[0] == 'UNKNOWN' for row in self.master.db.execute('SELECT status FROM restore_requests')))
+
+    def test_bad_or_incomplete_response_keeps_raw_evidence_and_marks_unknown(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        body = self.reply(batch).splitlines()[0] + b'\n'
+        self.master.finish_automatic_batch(batch[0], 200, body)
+        row = self.master.db.execute('SELECT * FROM restore_batches').fetchone()
+        self.assertEqual(row['response'], body)
+        self.assertIn('omitted', row['error'])
+        summary = self.master.automatic_status()
+        self.assertEqual(summary['unknown_outcomes'], 1)
+        self.assertEqual(summary['status_counts']['OK'], 1)
+        self.assertEqual(summary['status_counts']['UNKNOWN'], 5)
+        self.assertEqual(row['state'], 'partial')
+
+    def test_pause_stop_disabled_and_manual_exclusion(self):
+        self.result(self.claim(), [BLOB])
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.enable()
+        self.master.console('pause')
+        self.assertIsNone(self.master.prepare_automatic_batch())
+        self.assertEqual(self.master.automatic_status()['state'], 'paused')
+        self.master.console('resume')
+        with self.assertRaisesRegex(ValueError, 'Automatic'):
+            self.master.start_restore(['inv2_candidate', 'all', 'unused'])
+        svc.STOP.set()
+        try:
+            self.assertIsNone(self.master.prepare_automatic_batch())
+        finally:
+            svc.STOP.clear()
+
+    def test_recent_rates_eta_and_stale_inventory(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        self.master.finish_automatic_batch(batch[0], 200, self.reply(batch))
+        summary = self.master.automatic_status()
+        self.assertEqual(summary['completed_blobs'], 1)
+        self.assertEqual(summary['completed_bytes'], 4096)
+        self.assertEqual(summary['awaiting_rescan'], 1)
+        self.assertGreater(summary['blobs_per_second'], 0)
+        self.assertEqual(summary['eta_seconds'], 0)
+        self.assertEqual(summary['status_counts']['OK'], 6)
+        self.assertGreater(summary['phase_rates']['inv2_only']['blobs_per_second'], 0)
+        self.assertEqual(summary['phase_rates']['inv1']['blobs_per_second'], 0)
+        with self.master.db:
+            self.master.db.execute('UPDATE restore_batches SET finished=?', (time.time() - 301,))
+            self.master.db.execute('UPDATE groups SET seen=0')
+        summary = self.master.automatic_status()
+        self.assertEqual(summary['blobs_per_second'], 0)
+        self.assertIsNone(summary['eta_seconds'])
+        self.assertEqual(summary['excluded_blobs'], 1)
+
+    def test_eta_requires_observed_rate_for_each_pending_phase(self):
+        self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB]))
+        self.enable()
+        batch = self.master.prepare_automatic_batch()
+        self.master.finish_automatic_batch(batch[0], 200, self.reply(batch))
+        other = '[42:7:259:3:5:4096:0]'
+        self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB, other]))
+        summary = self.master.automatic_status()
+        self.assertEqual(summary['pending_inv2_only'], 1)
+        self.assertGreater(summary['phase_rates']['inv1']['blobs_per_second'], 0)
+        self.assertEqual(summary['phase_rates']['inv2_only']['blobs_per_second'], 0)
+        self.assertIsNone(summary['eta_seconds'])
+
+    def test_legacy_database_migration_preserves_candidate_metadata(self):
+        self.result(self.claim(), dict(inv1_candidate=[BLOB], inv2_candidate=[BLOB]), completed=list(range(3, 9)))
+        saved = dict(self.master.db.execute('SELECT * FROM restore_candidates LIMIT 1').fetchone())
+        # Recreate only the candidate table in its original schema; old servers
+        # also have no manual or automatic restore history tables.
+        with self.master.db:
+            self.master.db.executescript('''
+                ALTER TABLE restore_candidates RENAME TO migrated_candidates;
+                CREATE TABLE restore_candidates(gid INTEGER,category TEXT,blob TEXT,first_seen REAL,last_seen REAL,
+                    active INTEGER,coverage TEXT NOT NULL,generation INTEGER,fingerprint TEXT,PRIMARY KEY(gid,category,blob));
+                INSERT INTO restore_candidates SELECT gid,category,blob,first_seen,last_seen,active,coverage,generation,fingerprint
+                    FROM migrated_candidates;
+                DROP TABLE migrated_candidates;
+                DROP TABLE restore_runs;
+                DROP TABLE restore_requests;
+                DROP TABLE restore_attempts;
+                DROP TABLE restore_batches;
+                DROP TABLE auto_restore_work;
+            ''')
+        self.master.db.close()
+        self.master = svc.Master(args(restore=True), self.directory)
+        row = dict(self.master.db.execute('SELECT * FROM restore_candidates WHERE category=?', (saved['category'],)).fetchone())
+        for field in ('gid', 'blob', 'first_seen', 'last_seen', 'active', 'coverage', 'generation', 'fingerprint'):
+            self.assertEqual(row[field], saved[field])
+        self.assertEqual(row['realm_mask'], 6)
+        self.assertEqual(row['scan_started'], 0)
+        self.assertIsNotNone(self.master.prepare_automatic_batch())
+
+    def test_background_http_runs_without_db_lock_and_stops_after_current_batch(self):
+        self.result(self.claim(), [BLOB])
+        self.enable()
+        entered, release = threading.Event(), threading.Event()
+
+        def request(options, body):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            svc.STOP.set()
+            return 200, self.reply(('unused', body))
+        thread = threading.Thread(target=self.master.run_automatic_restore)
+        with patch.object(svc, 'restore_part_request', side_effect=request):
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertTrue(self.master.lock.acquire(timeout=1))
+                try:
+                    self.assertEqual(self.master.automatic_status()['inflight_blobs'], 1)
+                finally:
+                    self.master.lock.release()
+            finally:
+                release.set()
+                thread.join(5)
+                svc.STOP.clear()
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.master.automatic_status()['completed_blobs'], 1)
+
+
+class TestRestorePartHttp(unittest.TestCase):
+    def test_post_auth_parameters_and_non2xx_body_are_preserved(self):
+        received = []
+        response_body = b'partial outcomes retained\n'
+
+        class Handler(svc.http_server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append((self.path, self.headers.get('Authorization'), self.headers.get('Content-Type'),
+                                 self.rfile.read(int(self.headers['Content-Length']))))
+                self.send_response(504)
+                self.send_header('Content-Length', str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+
+            def log_message(self, *_):
+                pass
+        server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        body = b'requests=%5B1%3A1%3A1%3A1%3A0%5D+blob&timeout=60&inflight=16'
+        try:
+            params = common.ConnectionParams()
+            params.token = 'test-token'
+            with patch.object(common, 'connection_params', params):
+                actual = svc.restore_part_request(args(viewer='http://127.0.0.1:%d' % server.server_port), body)
+            self.assertEqual(actual, (504, response_body))
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0][0], '/restore_part')
+            self.assertIn('test-token', received[0][1])
+            self.assertEqual(received[0][2], 'application/x-www-form-urlencoded')
+            self.assertEqual(received[0][3], body)
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
+
 class TestHttp(unittest.TestCase):
     def test_restore_get_blob_validates_binary_response_without_retries(self):
         requests = []
@@ -1056,7 +1439,7 @@ class TestCLI(unittest.TestCase):
         run.assert_not_called()
 
     def test_commands_parse(self):
-        for tail in (['master', '-l', '22570', '--db', '/tmp/master', '--console-sock', '/tmp/socket'],
+        for tail in (['master', '-l', '22570', '--db', '/tmp/master', '--console-sock', '/tmp/socket', '--restore', '--restore-inflight', '8', '--restore-timeout', '120'],
                      ['worker', '--master', 'host:22570', '--db', '/tmp/worker'],
                      ['client', '--console-sock', '/tmp/socket']):
             parser = ArgumentParser()

@@ -113,6 +113,7 @@
 #include <ydb/core/blobstorage/other/mon_blob_range_page.h>
 #include <ydb/core/blobstorage/other/mon_check_integrity.h>
 #include <ydb/core/blobstorage/other/mon_restore_part.h>
+#include <ydb/core/blobstorage/other/mon_blob_rescue_service.h>
 #include <ydb/core/blobstorage/other/mon_vdisk_stream.h>
 
 #include <ydb/public/lib/deprecated/client/msgbus_client.h>
@@ -1897,6 +1898,8 @@ void TKikimrRunner::InitializeActorSystem(
             TMailboxType::HTSwap, AppData->SystemPoolId));
         setup->LocalServices.emplace_back(MakeMonRestorePartId(), TActorSetupCmd(CreateMonRestorePartActor(),
             TMailboxType::HTSwap, AppData->SystemPoolId));
+        setup->LocalServices.emplace_back(MakeMonBlobRescueServiceId(), TActorSetupCmd(CreateMonBlobRescueServiceActor(),
+            TMailboxType::HTSwap, AppData->SystemPoolId));
     }
 
     ApplyLogSettings(runConfig);
@@ -1983,6 +1986,14 @@ void TKikimrRunner::InitializeActorSystem(
                 false,
                 ActorSystem.Get(),
                 MakeMonRestorePartId());
+
+        Monitoring->RegisterActorPage(
+                nullptr,
+                "blob_rescue_service",
+                "Blob Rescue Service",
+                false,
+                ActorSystem.Get(),
+                MakeMonBlobRescueServiceId());
 
         Monitoring->RegisterActorPage(
                 nullptr,
