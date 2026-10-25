@@ -397,6 +397,127 @@ class TestMaster(unittest.TestCase):
             server.server_close()
             svc.STOP.clear()
 
+    def test_restore_preview_counts_candidate_ids_and_excludes_stale_or_outdated(self):
+        other = '[42:7:259:3:5:8192:0]'
+        self.result(self.claim(), {'inv1_candidate': [BLOB], 'inv2_candidate': [BLOB, other]})
+        self.add_group(layout(2, list(range(11, 20))))
+        self.result(self.claim(), [BLOB])
+        with patch.object(svc, 'ydb_http') as request, patch.object(svc, 'restore_blob') as restore:
+            inv1 = json.loads(self.master.console('restore-preview inv1_candidate'))
+            inv2 = json.loads(self.master.console('restore-preview inv2_candidate all'))
+            group = json.loads(self.master.console('restore-preview inv2_candidate 1'))
+            self.assertEqual((inv1['blobs'], inv1['logical_bytes'], inv1['groups']), (1, 4096, 1))
+            self.assertEqual((inv2['blobs'], inv2['logical_bytes'], inv2['groups']), (3, 16384, 2))
+            self.assertEqual((group['blobs'], group['logical_bytes']), (2, 12288))
+            self.assertIsNone(inv1['run'])
+            with self.master.db:
+                self.master.db.execute('UPDATE groups SET seen=0 WHERE id=2')
+                self.master.db.execute('UPDATE restore_candidates SET fingerprint="old" WHERE blob=?', (other,))
+            inv2 = json.loads(self.master.console('restore-preview inv2_candidate'))
+            self.assertEqual((inv2['blobs'], inv2['logical_bytes']), (1, 4096))
+            self.assertEqual((inv2['excluded_blobs'], inv2['excluded_logical_bytes']), (2, 12288))
+            request.assert_not_called()
+            restore.assert_not_called()
+
+    def test_restore_rejects_changed_preview_and_invalid_selection_without_requests(self):
+        self.result(self.claim(), [BLOB])
+        preview = json.loads(self.master.console('restore-preview inv2_candidate'))
+        with self.master.db:
+            self.master.db.execute('UPDATE restore_candidates SET active=0')
+        with patch.object(svc, 'restore_blob') as restore:
+            with self.assertRaisesRegex(ValueError, 'changed'):
+                self.master.console('restore inv2_candidate all ' + preview['token'])
+            for command in ('restore-preview all', 'restore-preview unknown', 'restore-preview inv1_candidate all 1',
+                            'restore inv2_candidate', 'restore inv2_candidate all invalid'):
+                with self.subTest(command=command), self.assertRaises(ValueError):
+                    self.master.console(command)
+            empty = json.loads(self.master.console('restore-preview inv1_candidate'))
+            with self.assertRaisesRegex(ValueError, 'No current'):
+                self.master.console('restore inv1_candidate all ' + empty['token'])
+            restore.assert_not_called()
+        self.assertIsNone(json.loads(self.master.console('restore-status')))
+
+    def test_restore_runs_in_background_reports_outcomes_and_preserves_candidates(self):
+        blobs = [f'[42:7:{step}:3:5:4096:0]' for step in range(258, 262)]
+        self.result(self.claim(), blobs)
+        preview = json.loads(self.master.console('restore-preview inv2_candidate'))
+        started, release = threading.Event(), threading.Event()
+        calls = []
+
+        def restore(_args, group, blob):
+            calls.append((group['id'], blob))
+            if blob == blobs[0]:
+                started.set()
+                self.assertTrue(release.wait(5))
+                return 'restored'
+            if blob == blobs[1]:
+                return 'absent'
+            raise TimeoutError('uncertain outcome')
+
+        with patch.object(svc, 'restore_blob', side_effect=restore), patch.object(svc, 'validate_layout') as validate:
+            command = 'restore inv2_candidate all ' + preview['token']
+            run = json.loads(self.master.console(command))
+            try:
+                self.assertTrue(started.wait(5))
+                self.assertEqual(json.loads(self.master.console('restore-status'))['state'], 'running')
+                with self.assertRaisesRegex(ValueError, 'already running'):
+                    self.master.console(command)
+                with self.master.lock, self.master.db:
+                    self.master.db.execute('UPDATE restore_candidates SET active=0 WHERE blob=?', (blobs[-1],))
+            finally:
+                release.set()
+                self.master._restore_thread.join(5)
+            self.assertFalse(self.master._restore_thread.is_alive())
+            validate.assert_called_once()
+        status = json.loads(self.master.console('restore-status'))
+        self.assertEqual(status['id'], run['id'])
+        self.assertEqual(status['state'], 'completed')
+        self.assertEqual([status[k] for k in ('restored', 'restored_bytes', 'absent', 'failed', 'skipped')],
+                         [1, 4096, 1, 1, 1])
+        self.assertEqual(status['errors'], [dict(gid=1, blob=blobs[2], error='uncertain outcome')])
+        self.assertEqual(calls, [(1, blob) for blob in blobs[:3]])
+        self.assertEqual(json.loads(self.master.console('candidates inv2_candidate'))['total'], 3)
+        self.assertEqual(self.master.db.execute('SELECT due FROM groups').fetchone()[0], 0)
+        self.master.db.close()
+        self.master = svc.Master(args(), self.directory)
+        self.assertEqual(json.loads(self.master.console('restore-status')), status)
+
+    def test_restore_checks_generation_and_marks_restart_interrupted_without_retry(self):
+        self.result(self.claim(), [BLOB])
+        with patch.object(svc, 'validate_layout', side_effect=ValueError('generation changed')), \
+                patch.object(svc, 'restore_blob') as restore:
+            self.master.console('restore inv2_candidate 1 ' + json.loads(
+                self.master.console('restore-preview inv2_candidate 1'))['token'])
+            self.master._restore_thread.join(5)
+            self.assertFalse(self.master._restore_thread.is_alive())
+            restore.assert_not_called()
+            status = json.loads(self.master.console('restore-status'))
+            self.assertEqual((status['state'], status['failed']), ('completed', 1))
+            status.update(state='running', finished_at=None)
+            with self.master.db:
+                self.master.save_restore_status(status)
+            self.master.db.close()
+            self.master = svc.Master(args(), self.directory)
+            interrupted = json.loads(self.master.console('restore-status'))
+            self.assertEqual(interrupted['state'], 'interrupted')
+            self.assertIn('unknown', interrupted['error'])
+            self.assertIsNone(self.master._restore_thread)
+            restore.assert_not_called()
+
+    def test_restore_does_not_issue_requests_after_stop_during_generation_check(self):
+        self.result(self.claim(), [BLOB])
+        preview = json.loads(self.master.console('restore-preview inv2_candidate'))
+        with patch.object(svc, 'validate_layout', side_effect=lambda *_: svc.STOP.set()), \
+                patch.object(svc, 'restore_blob') as restore:
+            try:
+                self.master.console('restore inv2_candidate all ' + preview['token'])
+                self.master._restore_thread.join(5)
+                self.assertFalse(self.master._restore_thread.is_alive())
+                restore.assert_not_called()
+                self.assertEqual(json.loads(self.master.console('restore-status'))['state'], 'interrupted')
+            finally:
+                svc.STOP.clear()
+
     def test_partial_worker_publishes_report_without_resolving_candidates(self):
         self.result(self.claim(), [BLOB])
         self.master.console('scan 1')
@@ -814,6 +935,52 @@ class TestWorker(unittest.TestCase):
 
 
 class TestHttp(unittest.TestCase):
+    def test_restore_get_blob_validates_binary_response_without_retries(self):
+        requests = []
+        replies = [(200, 'application/octet-stream', b'x' * 4096),
+                   (204, 'application/json', b''), (200, 'text/html', b'x' * 4096),
+                   (200, 'application/octet-stream', b'x' * 4095),
+                   (200, 'application/octet-stream', b'x' * 4097),
+                   (500, 'application/json', b'{"Status":"ERROR"}')]
+
+        class Handler(svc.http_server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.path, self.headers.get('Authorization')))
+                status, content_type, body = replies[len(requests) - 1]
+                self.send_response(status)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_):
+                pass
+
+        server = svc.http_server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        try:
+            options = args(viewer='http://127.0.0.1:%d' % server.server_port)
+            params = common.ConnectionParams()
+            params.token = 'test-token'
+            with patch.object(common, 'connection_params', params):
+                self.assertEqual(svc.restore_blob(options, layout(), BLOB), 'restored')
+                self.assertEqual(svc.restore_blob(options, layout(), BLOB), 'absent')
+                for _ in range(4):
+                    with self.assertRaises((ValueError, svc.urllib.error.HTTPError)):
+                        svc.restore_blob(options, layout(), BLOB)
+            self.assertEqual(len(requests), len(replies))
+            for path, auth in requests:
+                parsed = svc.urllib.parse.urlsplit(path)
+                self.assertEqual(parsed.path, '/get_blob')
+                self.assertEqual(svc.urllib.parse.parse_qs(parsed.query),
+                                 dict(groupId=['1'], blob=[BLOB], mustRestoreFirst=['1'], binary=['1']))
+                self.assertIn('test-token', auth)
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+
     def test_responses_close_sockets_without_resource_warnings(self):
         class Handler(svc.http_server.BaseHTTPRequestHandler):
             def do_GET(self):

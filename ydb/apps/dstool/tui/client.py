@@ -89,6 +89,12 @@ class ConsoleApp(App):
     #candidate-selected-group { width: 35; }
     #candidate-controls Button { min-width: 10; width: 10; }
     #candidate-summary { height: auto; }
+    #restore-controls { height: auto; }
+    #restore-category { width: 18; }
+    #restore-selected-group { width: 24; }
+    #restore-controls Button { min-width: 10; width: 10; }
+    #restore-summary { height: auto; margin-bottom: 1; }
+    #restore-progress { height: 1fr; overflow-y: auto; margin-top: 1; }
     #gc-table { height: 5; }
     #bucket-table { height: 10; }
     #gc-summary, #bucket-details { height: auto; padding: 0; }
@@ -121,6 +127,9 @@ class ConsoleApp(App):
         self._candidate_total = 0
         self._candidate_category = 'all'
         self._candidate_selected_group = True
+        self._restore_category = 'inv1_candidate'
+        self._restore_selected_group = False
+        self._restore_preview = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True, icon='>')
@@ -167,6 +176,17 @@ class ConsoleApp(App):
                     yield Button('Next', id='candidate-next', disabled=True)
                 yield Static('', id='candidate-summary', markup=False)
                 yield DataTable(id='candidate-table', cursor_type='row', zebra_stripes=True)
+            with TabPane('Restore', id='restore'):
+                with Horizontal(id='restore-controls'):
+                    yield Select([('inv1', 'inv1_candidate'), ('inv2', 'inv2_candidate')],
+                                 value='inv1_candidate', allow_blank=False, id='restore-category')
+                    yield Checkbox('Selected group', id='restore-selected-group')
+                    yield Button('Preview', id='restore-preview')
+                    yield Button('Restore', id='restore-start', variant='warning', disabled=True)
+                yield Static('Loading preview…', id='restore-summary', markup=False)
+                yield Static('Successful requests may leave inv2 candidates; later scans recheck the layout.',
+                             classes='hint')
+                yield Static('No restore started.', id='restore-progress', markup=False)
             with TabPane('Console', id='console'):
                 yield RichLog(id='log', max_lines=2000, wrap=True, min_width=0, markup=False)
         yield Input(placeholder='Console command (help, layouts GROUP, scan GROUP, interval SEC, …)', id='command')
@@ -194,7 +214,7 @@ class ConsoleApp(App):
 
     def _move_tab(self, step):
         tabs = self.query_one('#views', TabbedContent)
-        order = ('pools', 'groups', 'layouts', 'workers', 'candidates', 'console')
+        order = ('pools', 'groups', 'layouts', 'workers', 'candidates', 'restore', 'console')
         self.set_focus(tabs.query_one(Tabs))
         tabs.active = order[(order.index(tabs.active) + step) % len(order)]
 
@@ -225,6 +245,11 @@ class ConsoleApp(App):
         self.query_one('#candidate-previous', Button).disabled = not self._connected or self._candidate_offset == 0
         self.query_one('#candidate-next', Button).disabled = (
             not self._connected or self._candidate_offset + 1000 >= self._candidate_total)
+        preview = self._restore_preview
+        self.query_one('#restore-preview', Button).disabled = not self._connected or self._command_busy
+        self.query_one('#restore-start', Button).disabled = (
+            not self._connected or self._command_busy or not preview or not preview['blobs']
+            or (preview['run'] is not None and preview['run']['state'] == 'running'))
 
     def _table(self, name, rows):
         table = self.query_one('#' + name, DataTable)
@@ -245,10 +270,16 @@ class ConsoleApp(App):
         group = self.detail_target[1] if selected and self.detail_target and self.detail_target[0] == 'group' else 'all'
         return category, group, self._candidate_offset
 
+    def _restore_query(self):
+        group = self.detail_target[1] if self._restore_selected_group and self.detail_target and (
+            self.detail_target[0] == 'group') else 'all'
+        return self._restore_category, group
+
     async def refresh_view(self):
         tabs = self.query_one('#views', TabbedContent)
         view, target = tabs.active, self.detail_target
         candidate_query = self._candidate_query()
+        restore_query = self._restore_query()
         try:
             self.stats = json.loads(await self.connection.request('stats'))
             s = self.stats
@@ -264,12 +295,17 @@ class ConsoleApp(App):
                 command = ('layouts ' if target[0] == 'group' else 'pools ') + shlex.quote(target[1])
             if view == 'candidates':
                 command = 'candidates %s %s %d 1000' % candidate_query
+            if view == 'restore':
+                command = 'restore-preview %s %s' % restore_query
             response = await self.connection.request(command) if command else None
             if tabs.active == view and self.detail_target == target and (
-                    view != 'candidates' or self._candidate_query() == candidate_query):
+                    view != 'candidates' or self._candidate_query() == candidate_query) and (
+                    view != 'restore' or self._restore_query() == restore_query):
                 self._render(view, response, target)
             self._status('Connected · updated ' + time.strftime('%H:%M:%S'), True)
         except CommandError as exc:
+            if view == 'restore':
+                self._restore_preview = None
             self._status(f'Command failed: {exc} · displayed data may be stale', True)
             self._log(str(exc))
         except (ConsoleError, ValueError, KeyError, TypeError) as exc:
@@ -313,6 +349,27 @@ class ConsoleApp(App):
             self._update_buttons()
         elif view == 'layouts':
             self._render_layout(json.loads(response), target)
+        elif view == 'restore':
+            self._restore_preview = data = json.loads(response)
+            scope = 'all groups' if data['group'] is None else 'group ' + str(data['group'])
+            self.query_one('#restore-summary', Static).update(
+                f"{scope} · {data['category']}\n"
+                f"Total: {data['blobs']:,} blobs · {size(data['logical_bytes'])} · {data['groups']:,} groups\n"
+                f"Excluded (outdated / stale): {data['excluded_blobs']:,} blobs · {size(data['excluded_logical_bytes'])}")
+            run = data['run']
+            progress = 'No restore started.'
+            if run:
+                done = sum(run[key] for key in ('restored', 'absent', 'failed', 'skipped'))
+                scope = 'all groups' if run['group'] is None else 'group ' + str(run['group'])
+                progress = (f"{run['state']} · {run['category']} · {scope} · {done:,}/{run['blobs']:,} blobs\n"
+                            f"Successful requests: {run['restored']:,} ({size(run['restored_bytes'])}) · "
+                            f"Absent: {run['absent']:,} · Failed: {run['failed']:,} · Skipped: {run['skipped']:,}")
+                if run.get('error'):
+                    progress += '\n' + run['error']
+                for error in run['errors']:
+                    progress += f"\nGroup {error['gid']} {error['blob']}: {error['error']}"
+            self.query_one('#restore-progress', Static).update(progress)
+            self._update_buttons()
 
     def _render_layout(self, data, target):
         self._layout_data = (data, target)
@@ -404,6 +461,11 @@ class ConsoleApp(App):
             self._candidate_category = event.value
             self._candidate_offset = 0
             self.action_refresh()
+        elif event.select.id == 'restore-category' and event.value in ('inv1_candidate', 'inv2_candidate'):
+            self._restore_category = event.value
+            self._restore_preview = None
+            self._update_buttons()
+            self.action_refresh()
 
     def on_checkbox_changed(self, event: Checkbox.Changed):
         if event.checkbox.id in ('show-phantom-like', 'inv1-candidate-only', 'inv2-candidate-only') and self._layout_data:
@@ -411,6 +473,11 @@ class ConsoleApp(App):
         elif event.checkbox.id == 'candidate-selected-group':
             self._candidate_selected_group = event.value
             self._candidate_offset = 0
+            self.action_refresh()
+        elif event.checkbox.id == 'restore-selected-group':
+            self._restore_selected_group = event.value
+            self._restore_preview = None
+            self._update_buttons()
             self.action_refresh()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected):
@@ -430,6 +497,8 @@ class ConsoleApp(App):
         else:
             return
         self._candidate_offset = 0
+        self._restore_preview = None
+        self._update_buttons()
         self._selected_layout = None
         self._layout_data = None
         self.query_one('#bucket-details', Collapsible).collapsed = True
@@ -487,6 +556,15 @@ class ConsoleApp(App):
             self.submit_command('scan all')
         elif event.button.id == 'inventory':
             self.submit_command('refresh')
+        elif event.button.id == 'restore-preview':
+            self._restore_preview = None
+            self._update_buttons()
+            self.action_refresh()
+        elif event.button.id == 'restore-start' and self._restore_preview:
+            category, group = self._restore_query()
+            token = self._restore_preview['token']
+            self._restore_preview = None
+            self.submit_command(f'restore {category} {group} {token}')
         elif event.button.id in ('candidate-previous', 'candidate-next'):
             self._candidate_offset = max(0, self._candidate_offset + (
                 -1000 if event.button.id == 'candidate-previous' else 1000))

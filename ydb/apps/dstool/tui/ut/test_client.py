@@ -364,6 +364,79 @@ class ConsoleAppTest(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(str(table.get_row_at(0)[1]), '2')
 
+    async def test_restore_preview_selection_background_progress_and_reconnect(self):
+        app = self.app()
+        started, release = threading.Event(), threading.Event()
+
+        def restore(*_):
+            started.set()
+            if not release.wait(5):
+                raise TimeoutError('test did not release restore')
+            return 'restored'
+
+        with patch.object(svc, 'validate_layout'), patch.object(svc, 'restore_blob', side_effect=restore) as request:
+            try:
+                async with app.run_test(size=(120, 35)) as pilot:
+                    await self.settle(app, pilot)
+                    await self.tab(app, pilot, 'restore')
+                    self.assertIn('restore-preview inv1_candidate all', self.connection.commands)
+                    self.assertIn('Total: 0 blobs', str(app.query_one('#restore-summary', Static).content))
+                    self.assertTrue(app.query_one('#restore-start', Button).disabled)
+                    app.query_one('#restore-category', Select).value = 'inv2_candidate'
+                    await self.settle(app, pilot)
+                    self.assertIn('Total: 1 blobs · 4.0 KiB', str(app.query_one('#restore-summary', Static).content))
+                    self.assertFalse(app.query_one('#restore-start', Button).disabled)
+                    request.assert_not_called()
+                    app.detail_target = ('group', str(self.gid))
+                    await pilot.click('#restore-selected-group')
+                    await self.settle(app, pilot)
+                    self.assertIn(f'restore-preview inv2_candidate {self.gid}', self.connection.commands)
+                    await pilot.click('#restore-start')
+                    await self.settle(app, pilot)
+                    self.assertTrue(started.is_set())
+                    self.assertTrue(app.query_one('#restore-start', Button).disabled)
+                    self.assertIn('running', str(app.query_one('#restore-progress', Static).content))
+                    await self.connection.close()
+                    app.action_refresh()
+                    await self.settle(app, pilot)
+                    self.assertIn('running', str(app.query_one('#restore-progress', Static).content))
+                    release.set()
+                    await asyncio.to_thread(self.master._restore_thread.join, 5)
+                    await pilot.click('#restore-preview')
+                    await self.settle(app, pilot)
+                    progress = str(app.query_one('#restore-progress', Static).content)
+                    self.assertIn('completed', progress)
+                    self.assertIn('Successful requests: 1 (4.0 KiB)', progress)
+                    self.assertEqual(sum(c.startswith('restore ') for c in self.connection.commands), 1)
+                    self.assertEqual(request.call_count, 1)
+            finally:
+                release.set()
+                if self.master._restore_thread:
+                    await asyncio.to_thread(self.master._restore_thread.join, 5)
+
+    async def test_restore_error_invalidates_preview_and_disconnect_disables_action(self):
+        app = self.app()
+        async with app.run_test(size=(80, 24)) as pilot:
+            await self.settle(app, pilot)
+            await self.tab(app, pilot, 'restore')
+            progress = app.query_one('#restore-progress', Static)
+            self.assertLessEqual(progress.region.bottom, app.query_one('#command', Input).region.y)
+            self.assertGreaterEqual(progress.region.height, 2)
+            app.query_one('#restore-category', Select).value = 'inv2_candidate'
+            await self.settle(app, pilot)
+            with patch.object(self.master, 'restore_plan', side_effect=ValueError('preview unavailable')):
+                app.action_refresh()
+                await self.settle(app, pilot)
+                self.assertTrue(app.query_one('#restore-start', Button).disabled)
+            app.action_refresh()
+            await self.settle(app, pilot)
+            self.assertFalse(app.query_one('#restore-start', Button).disabled)
+            await self.connection.close()
+            self.connection.path = str(Path(self.temp.name) / 'missing.sock')
+            app.action_refresh()
+            await self.settle(app, pilot)
+            self.assertTrue(app.query_one('#restore-start', Button).disabled)
+
     async def test_buttons_and_raw_commands(self):
         app = self.app()
         async with app.run_test(size=(100, 30)) as pilot:

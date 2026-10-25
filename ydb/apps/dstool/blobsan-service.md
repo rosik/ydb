@@ -89,6 +89,33 @@ show all groups. **Previous** and **Next** browse pages of up to 1000 entries.
 An overlapping candidate occupies one entry in each category. Enter on a
 candidate opens its group histogram.
 
+The **Restore** tab selects `inv1` (`inv1_candidate`, the default) or `inv2`
+(`inv2_candidate`). Its preview shows the number of active candidate BlobIds,
+their total logical size from BlobSize, and the number of groups. It covers
+all groups by default; **Selected group** limits it to the
+group opened from Groups or Candidates. Outdated candidates and stale group
+inventory are excluded and counted separately. **Preview** or **F5** refreshes
+these totals without issuing restoration requests.
+
+**Restore** starts one background job on the master for the previewed selection.
+If the eligible list or group generation changed, refresh the preview before
+starting. The master uses its own endpoint and credentials, verifies each
+group generation, then sends one `/get_blob` request per eligible
+candidate with `groupId`, the full `blob` ID, `mustRestoreFirst=1` and `binary=1`.
+Requests run sequentially and are never automatically retried. The response
+must be HTTP 200 with binary data of exactly BlobSize bytes; HTTP 204 is
+reported as absent. The tab reports successful requests, bytes, absent blobs,
+failures and candidates skipped because their inventory or membership changed.
+Only one restore job can run at a time. Closing or reconnecting the client
+does not stop it. Progress persists in SQLite; a master restart marks an
+unfinished job interrupted, with a possibly unknown last request outcome.
+
+After a job, its groups are scheduled for another scan. Candidate lists remain
+active until scans reevaluate them. A successful MustRestoreFirst request does
+not guarantee that `inv2_candidate` becomes false: `TEvGet` can succeed with one
+replica in each of three realms, or two replicas in each of two realms.
+Automatic scans and workers continue to issue no restoration requests.
+
 The active view and statistics refresh every five seconds (`client --refresh
 SEC`). **F5** refreshes immediately, **[** / **]** switch tabs, **Ctrl+L** focuses
 the command input, and **Ctrl+Q** exits. Buttons pause/resume assignment,
@@ -108,6 +135,9 @@ automatically because their effect may already have been applied.
 | `pools [POOL]` | Histograms summed over latest group reports; select by pool name or `BoxId:StoragePoolId` (`static` for static groups) |
 | `workers` | Known workers and last contact timestamps |
 | `candidates CATEGORY [GROUP\|all] [OFFSET] [LIMIT]` | Candidate BlobIds; CATEGORY is `all`, `inv1_candidate` or `inv2_candidate`; default offset 0, limit 1000, maximum limit 1000 |
+| `restore-preview CATEGORY [GROUP\|all]` | Eligible blob count, logical bytes, excluded candidates and a preview token; CATEGORY is `inv1_candidate` or `inv2_candidate` |
+| `restore CATEGORY GROUP\|all PREVIEW_TOKEN` | Start a background restore for the unchanged preview |
+| `restore-status` | Latest restore job progress and up to 20 errors |
 | `pause` / `resume` | Stop/resume assigning new jobs; running jobs finish |
 | `scan [GROUP\|all]` | Make a group/all groups eligible for scanning now |
 | `interval SECONDS` | Set the clean-group rescan interval |

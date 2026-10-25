@@ -110,12 +110,48 @@ def view(args, path, **params):
 
 
 def ydb_http(args, url, raw=False):
+    return http(url, token_headers(), timeout=args.request_timeout, raw=raw, context=ydb_ssl_context())
+
+
+def ydb_ssl_context():
     params = common.connection_params
     context = ssl.create_default_context(cafile=params.cafile)
     if params.insecure:
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
-    return http(url, token_headers(), timeout=args.request_timeout, raw=raw, context=context)
+    return context
+
+
+def blob_size(blob):
+    return int(blob[1:-1].split(':')[5])
+
+
+def restore_blob(args, layout, blob):
+    """Issue one MustRestoreFirst read, without retrying an uncertain outcome."""
+    params = dict(groupId=layout['id'], blob=blob, mustRestoreFirst=1, binary=1)
+    url = viewer_url(args) + '/get_blob?' + urllib.parse.urlencode(params)
+    request = urllib.request.Request(url, headers=token_headers())
+    expected = blob_size(blob)
+    try:
+        with urllib.request.urlopen(request, timeout=args.request_timeout, context=ydb_ssl_context()) as response:
+            if response.status == 204:
+                return 'absent'
+            if response.status != 200 or response.headers.get_content_type() != 'application/octet-stream':
+                raise ValueError('Unexpected get_blob response: HTTP %d' % response.status)
+            received = 0
+            while True:
+                chunk = response.read(min(65536, expected + 1 - received))
+                if not chunk:
+                    break
+                received += len(chunk)
+                if received > expected:
+                    break
+            if received != expected:
+                raise ValueError('get_blob returned %d bytes; expected %d' % (received, expected))
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        raise
+    return 'restored'
 
 
 def topology(args):
@@ -200,10 +236,18 @@ class Master:
             CREATE TABLE IF NOT EXISTS scan_reports(
                 gid INTEGER PRIMARY KEY, generation INTEGER, fingerprint TEXT,
                 started REAL, finished REAL, result TEXT);
+            CREATE TABLE IF NOT EXISTS restore_runs(id TEXT PRIMARY KEY, result TEXT NOT NULL);
         ''')
         for key, value in [('paused', 0), ('interval', args.interval), ('retry', args.retry)]:
             self.db.execute('INSERT OR IGNORE INTO settings VALUES(?,?)', (key, str(value)))
         self.db.commit()
+        self._restore_thread = None
+        previous = self.restore_status()
+        if previous and previous['state'] == 'running':
+            previous.update(state='interrupted', finished_at=time.time(),
+                            error='Master restarted; the last request outcome may be unknown. Refresh candidates before repeating.')
+            with self.db:
+                self.save_restore_status(previous)
 
     def setting(self, key):
         return float(self.db.execute('SELECT value FROM settings WHERE key=?', (key,)).fetchone()[0])
@@ -437,6 +481,122 @@ class Master:
             items.append(item)
         return dict(category=category, group=gid, offset=offset, limit=limit, total=total, rows=items)
 
+    def restore_status(self):
+        row = self.db.execute('SELECT result FROM restore_runs ORDER BY rowid DESC LIMIT 1').fetchone()
+        return json.loads(row[0]) if row else None
+
+    def save_restore_status(self, run):
+        self.db.execute('INSERT INTO restore_runs VALUES(?,?) ON CONFLICT(id) DO UPDATE SET result=excluded.result',
+                        (run['id'], json.dumps(run)))
+
+    def restore_plan(self, words, collect=False):
+        if len(words) not in (1, 2) or words[0] not in CATEGORIES:
+            raise ValueError('Use restore-preview CATEGORY [GROUP|all]; CATEGORY is inv1_candidate or inv2_candidate')
+        category = words[0]
+        gid = None if len(words) == 1 or words[1] == 'all' else int(words[1])
+        query = '''SELECT c.gid,c.blob,c.generation,c.fingerprint,g.layout,g.seen FROM restore_candidates c
+            JOIN groups g ON g.id=c.gid WHERE c.active=1 AND c.category=?'''
+        values = (category,)
+        if gid is not None:
+            query += ' AND c.gid=?'
+            values += (gid,)
+        rows = self.db.execute(query + ' ORDER BY c.gid,c.blob', values)
+        plan, groups = [], set()
+        preview = dict(category=category, group=gid, blobs=0, logical_bytes=0, excluded_blobs=0, excluded_logical_bytes=0)
+        digest = hashlib.sha256(encode([category, gid]))
+        fresh = time.time() - self.args.refresh * 2
+        layout = None
+        for row in rows:
+            if layout is None or layout['id'] != row['gid']:
+                layout = json.loads(row['layout'])
+            length = blob_size(row['blob'])
+            if row['seen'] < fresh or row['fingerprint'] != layout['fingerprint'] or row['generation'] != layout['generation']:
+                preview['excluded_blobs'] += 1
+                preview['excluded_logical_bytes'] += length
+                continue
+            preview['blobs'] += 1
+            preview['logical_bytes'] += length
+            groups.add(row['gid'])
+            digest.update(encode([row['gid'], row['blob'], row['generation'], row['fingerprint']]))
+            if collect:
+                plan.append((layout, row['blob']))
+        preview.update(groups=len(groups), token=digest.hexdigest())
+        return preview, plan
+
+    def start_restore(self, words):
+        if len(words) != 3:
+            raise ValueError('Use restore CATEGORY GROUP|all PREVIEW_TOKEN')
+        previous = self.restore_status()
+        if previous and previous['state'] == 'running':
+            raise ValueError('A restore is already running')
+        preview, plan = self.restore_plan(words[:2], collect=True)
+        if preview['token'] != words[2]:
+            raise ValueError('Restore candidates changed; refresh the preview before restoring')
+        if not plan:
+            raise ValueError('No current restore candidates in this selection')
+        run = dict(preview, id=uuid.uuid4().hex, state='running', started_at=time.time(), finished_at=None,
+                   restored=0, restored_bytes=0, absent=0, failed=0, skipped=0, errors=[])
+        self.save_restore_status(run)
+        # Publish the job before returning to the client; HTTP runs outside the DB lock.
+        self._restore_thread = threading.Thread(target=self.run_restore, args=(run, plan), daemon=True)
+        self._restore_thread.start()
+        return run
+
+    def run_restore(self, run, plan):
+        checked, group_error = None, None
+        try:
+            for layout, blob in plan:
+                if STOP.is_set():
+                    run.update(state='interrupted', error='Master stopped; remaining requests were not issued')
+                    break
+                gid = layout['id']
+                try:
+                    if checked != gid:
+                        checked, group_error = gid, None
+                        try:
+                            validate_layout(self.args, dict(layout=layout))
+                        except Exception as exc:
+                            group_error = str(exc)
+                    with self.lock:
+                        row = self.db.execute('''SELECT g.layout,g.seen,c.active,c.generation,c.fingerprint
+                            FROM groups g JOIN restore_candidates c
+                            ON c.gid=g.id WHERE g.id=? AND c.category=? AND c.blob=?''',
+                                              (gid, run['category'], blob)).fetchone()
+                        current = json.loads(row['layout']) if row else None
+                        eligible = row and row['active'] and row['seen'] >= time.time() - self.args.refresh * 2 and (
+                            current['fingerprint'] == row['fingerprint'] == layout['fingerprint']
+                            and current['generation'] == row['generation'] == layout['generation'])
+                    if not eligible:
+                        run['skipped'] += 1
+                        continue
+                    if STOP.is_set():
+                        run.update(state='interrupted', error='Master stopped; remaining requests were not issued')
+                        break
+                    if group_error:
+                        raise ValueError(group_error)
+                    status = restore_blob(self.args, layout, blob)
+                    run[status] += 1
+                    if status == 'restored':
+                        run['restored_bytes'] += blob_size(blob)
+                except Exception as exc:
+                    run['failed'] += 1
+                    if len(run['errors']) < 20:
+                        run['errors'].append(dict(gid=gid, blob=blob, error=str(exc)[:500]))
+                    log_failure('Restore group %s blob %s failed', exc, gid, blob)
+                finally:
+                    with self.lock, self.db:
+                        self.save_restore_status(run)
+            else:
+                run['state'] = 'completed'
+        except Exception as exc:
+            run.update(state='interrupted', error=str(exc)[:500])
+            log_failure('Restore job failed', exc)
+        finally:
+            run['finished_at'] = time.time()
+            with self.lock, self.db:
+                self.save_restore_status(run)
+                self.db.executemany('UPDATE groups SET due=0 WHERE id=?', ((gid,) for gid in {g['id'] for g, _ in plan}))
+
     def console(self, command):
         words = shlex.split(command)
         if not words:
@@ -457,6 +617,13 @@ class Master:
                 self.refresh.set()
             elif op == 'candidates':
                 return json.dumps(self.candidates(words[1:]))
+            elif op == 'restore-preview':
+                preview, _ = self.restore_plan(words[1:])
+                return json.dumps(dict(preview, run=self.restore_status()))
+            elif op == 'restore-status':
+                return json.dumps(self.restore_status())
+            elif op == 'restore':
+                return json.dumps(self.start_restore(words[1:]))
             elif op == 'layouts':
                 return json.dumps(self.layouts(int(words[1]), time.time()), indent=2)
             elif op == 'pools':
@@ -508,6 +675,7 @@ class Master:
             elif op == 'help':
                 return ('stats | groups [brief] | layouts GROUP | pools [POOL] | workers | '
                         'candidates CATEGORY [GROUP|all] [OFFSET] [LIMIT] (max 1000/page) | '
+                        'restore-preview CATEGORY [GROUP|all] | restore CATEGORY GROUP|all PREVIEW_TOKEN | restore-status | '
                         'pause | resume | scan [GROUP|all] | interval SEC | retry SEC | refresh | quit')
             else:
                 raise ValueError('Unknown command; use help')
